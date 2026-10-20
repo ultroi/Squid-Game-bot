@@ -42,7 +42,9 @@ async def _refresh(context, mid, event=None, finished=False):
         context.bot, match, "vote", details=_details(match),
         event=game.get("last_event"), finished=finished,
     )
-    await refresh_lobby_scoreboard(context, mid)
+    # Scoreboard update optimization: only refresh it when the round finishes
+    if finished:
+        await refresh_lobby_scoreboard(context, mid, force=True)
 
 
 async def begin(context, mid):
@@ -137,7 +139,14 @@ async def on_vote(update, context):
 
     await safe_answer(q, "Vote registered 🗳")
     if voter_dm_mid:
-        await safe_edit(context.bot, q.from_user.id, voter_dm_mid, "✅ <b>Vote registered.</b> Waiting for the others…")
+        await safe_edit(
+            context.bot, 
+            q.from_user.id, 
+            voter_dm_mid, 
+            "✅ <b>Vote registered.</b> Waiting for the others…",
+            reply_markup=ui.kb([])  
+        )
+        
     await _refresh(context, mid)
 
     if trigger_resolve:

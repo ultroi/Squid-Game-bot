@@ -3,11 +3,12 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-
+import html
 from telegram import Update
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ChatMember, ChatMemberUpdated
 from .. import config, runtime, ui
 from ..database import matches
 from ..manager import advance, safe_edit, safe_answer, refresh_lobby_scoreboard
@@ -27,6 +28,62 @@ from ..repository import (
 log = logging.getLogger(__name__)
 _welcome_video_lock = asyncio.Lock()
 _lobby_create_locks: dict[int, asyncio.Lock] = {}
+
+
+def extract_status_change(chat_member_update: ChatMemberUpdated) -> tuple[bool, bool] | None:
+    """Extracts whether the bot's active status changed."""
+    status_change = chat_member_update.difference().get("status")
+    old_is_member, new_is_member = chat_member_update.difference().get("is_member", (None, None))
+
+    if status_change is None:
+        return None
+
+    old_status, new_status = status_change
+    was_member = old_status in [
+        ChatMember.MEMBER,
+        ChatMember.OWNER,
+        ChatMember.ADMINISTRATOR,
+    ] or (old_status == ChatMember.RESTRICTED and old_is_member is True)
+    is_member = new_status in [
+        ChatMember.MEMBER,
+        ChatMember.OWNER,
+        ChatMember.ADMINISTRATOR,
+    ] or (new_status == ChatMember.RESTRICTED and new_is_member is True)
+
+    return was_member, is_member
+
+async def track_group_memberships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Updates the database when the bot is added to or removed from a group."""
+    result = extract_status_change(update.my_chat_member)
+    if result is None:
+        return
+    
+    was_member, is_member = result
+    chat = update.effective_chat
+    
+    # We only care about groups and supergroups
+    if not chat or chat.type not in ["group", "supergroup"]:
+        return
+
+    try:
+        from ..database import groups
+        if not was_member and is_member:
+            # Bot was added to a group
+            await groups.update_one(
+                {"_id": chat.id},
+                {"$set": {"active": True, "title": chat.title}},
+                upsert=True
+            )
+            log.info("Bot added to group: %s (%s)", chat.title, chat.id)
+        elif was_member and not is_member:
+            # Bot was removed or kicked
+            await groups.update_one(
+                {"_id": chat.id},
+                {"$set": {"active": False}}
+            )
+            log.info("Bot removed from group: %s (%s)", chat.title, chat.id)
+    except Exception:
+        log.exception("Failed to update group membership tracker for %s", chat.id)
 
 
 
@@ -212,12 +269,16 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         match = await get_match(mid)
         if not match or match.get("stage") != "lobby":
             response = ("Lobby is closed.", True)
-        elif await is_user_in_other_active_match(uid, mid): # <-- ADD THIS NEW CHECK
+        elif await is_user_in_other_active_match(uid, mid): 
             response = ("⚠️ You are already in another active game!", True)
         elif _lobby_seconds_left(match) <= 0:
             response = ("Lobby timer has expired. Please wait for it to close.", True)
         elif any(p.get("id") == uid for p in match.get("players", [])):
             response = ("You're already registered! 👥", False)
+        # --- NEW CHECK: PREVENT JOINING MULTIPLE LOBBIES ---
+        elif await matches.find_one({"stage": "lobby", "_id": {"$ne": match.get("_id")}, "players.id": uid}):
+            response = ("⚠️ You are already waiting in another lobby! You can only join one at a time.", True)
+        # ---------------------------------------------------
         elif len(match.get("players", [])) >= config.MAX_PLAYERS:
             response = (f"Game is full ({config.MAX_PLAYERS})!", True)
         else:
@@ -487,3 +548,178 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await message.reply_text(text, parse_mode="HTML")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    # User ka ID nikal lein
+    user_id = user.id
+
+    text = (
+        "🔺 <b>SQUID GAME BOT</b> 🔺\n\n"
+        "Welcome to the ultimate survival game! Here is everything you need to know to host, play, and survive.\n\n"
+        "🛠 <b>COMMANDS</b>\n"
+        "• /enterthehell - Start a new game lobby in a group.\n"
+        "• /cancelgame - Forcefully end an active game (Admin/Host only).\n"
+        "• /stats - View global bot statistics.\n"
+        "• /help - Show this comprehensive guide.\n"
+        "• /report - to report a bug and give a suggestion.\n"
+    )
+
+    # Button ke data me user_id attach kar diya
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 Read Game Guide", callback_data=f"help:guide:{user_id}")]
+    ])
+
+    await context.bot.send_message(
+        chat_id=message.chat_id,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True
+    )
+
+
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the inline buttons for the /help menu with user security."""
+    query = update.callback_query
+    data = query.data
+    parts = data.split(":")
+
+    # Data check (e.g., help:guide:123456789)
+    if len(parts) != 3 or parts[0] != "help":
+        return
+        
+    action = parts[1]
+    target_user_id = int(parts[2])
+
+    # 🔒 SECURITY CHECK: Sirf wahi click kar payega jisne command di thi
+    if query.from_user.id != target_user_id:
+        await query.answer("⚠️ Not For You", show_alert=True)
+        return
+
+    if action == "guide":
+        text = (
+            "🦑 <b>THE GAMES (DEEP GUIDE)</b>\n\n"
+            "🟢 <b>Round 1: Red Light, Green Light</b>\n"
+            "• <b>Objective:</b> Reach the finish line before time runs out.\n"
+            "• <b>Rule:</b> Tap <code>⬆️ MOVE FORWARD</code> <i>only</i> when the light is GREEN. If you move on RED, you are eliminated.\n\n"
+            "🍪 <b>Round 2: Dalgona Candy</b>\n"
+            "• <b>Objective:</b> Memorize and repeat the flashing pattern.\n"
+            "• <b>Rule:</b> A shape flashes on the group grid. Repeat the exact 1-9 tile sequence in your DM. One wrong tap breaks your candy.\n\n"
+            "🎱 <b>Round 3: Marbles (Odd or Even)</b>\n"
+            "• <b>Objective:</b> Steal all opponent's marbles.\n"
+            "• <b>Rule:</b> One player hides marbles, the other bets and guesses <b>ODD</b> or <b>EVEN</b>. First to hit 0 marbles dies.\n\n"
+            "🌉 <b>Round 4: Glass Bridge</b>\n"
+            "• <b>Objective:</b> Cross the bridge safely.\n"
+            "• <b>Rule:</b> Choose <b>LEFT</b> or <b>RIGHT</b> glass panels. One is safe, the other shatters.\n\n"
+            "🗳 <b>Round 5: Elimination Vote</b>\n"
+            "• <b>Objective:</b> Survive the group vote.\n"
+            "• <b>Rule:</b> Vote privately in DMs to execute one player. The player with the most votes is eliminated.\n\n"
+            "⚔️ <b>Round 6: Squid Game (The Final)</b>\n"
+            "• <b>Objective:</b> Win the 1v1 tactical showdown.\n"
+            "• <b>Rule:</b> Offensive beats Defensive, Defensive beats Trickster, Trickster beats Offensive."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Commands", callback_data=f"help:main:{target_user_id}")]
+        ])
+        
+        try:
+            await query.answer()
+            await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception:
+            pass
+
+    elif action == "main":
+        text = (
+            "🔺 <b>SQUID GAME BOT — OFFICIAL GUIDE</b> 🔺\n\n"
+            "Welcome to the ultimate survival game! Here is everything you need to know to host, play, and survive.\n\n"
+            "🛠 <b>COMMANDS</b>\n"
+            "• /enterthehell - Start a new game lobby in a group.\n"
+            "• /cancelgame - Forcefully end an active game (Admin/Host only).\n"
+            "• /stats - View global bot statistics.\n"
+            "• /help - Show this comprehensive guide.\n"
+            "• /report - to report a bug and give a suggestion.\n"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 Read Game Guide", callback_data=f"help:guide:{target_user_id}")]
+        ])
+        
+        try:
+            await query.answer()
+            await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=keyboard)
+        except Exception:
+            pass
+
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not message or not user or not chat:
+        return
+
+    # Telegram uses 'text' for plain messages and 'caption' for media messages
+    text_content = message.text or message.caption or ""
+    
+    args = text_content.split(maxsplit=1)
+    
+    # Check if they provided text OR attached media
+    has_media = bool(message.photo or message.video or message.document or message.animation)
+    if len(args) < 2 and not has_media:
+        await message.reply_text(
+            "⚠️ <b>How to report a bug:</b>\n"
+            "<code>/report &lt;describe the issue&gt;</code>\n\n"
+            "<i>Tip: You can also attach a photo or video and write /report in the caption!</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    report_text = args[1] if len(args) > 1 else "<i>(Media attached without extra text)</i>"
+    BOT_ADMIN = 6439532660  # Your Admin ID
+
+    # Auto-detect location data
+    chat_type = chat.type.capitalize()
+    chat_name = html.escape(chat.title if chat.title else "Private Message")
+
+    admin_msg = (
+        "🚨 <b>NEW BUG REPORT</b> 🚨\n\n"
+        f"👤 <b>From:</b> {html.escape(user.full_name)} (<code>{user.id}</code>)\n"
+        f"💬 <b>Username:</b> @{user.username if user.username else 'N/A'}\n"
+        f"📍 <b>Source:</b> {chat_name} (<code>{chat.id}</code>) — {chat_type}\n\n"
+        f"📝 <b>Report Text:</b>\n{html.escape(report_text)}"
+    )
+
+    try:
+        # 1. Send the detailed text report to Admin
+        await context.bot.send_message(
+            chat_id=BOT_ADMIN, 
+            text=admin_msg, 
+            parse_mode="HTML"
+        )
+        
+        # 2. If the user attached media, copy the exact media message to Admin
+        # (We use copy_message to bypass users who have forwarding privacy restrictions)
+        if has_media:
+            await context.bot.copy_message(
+                chat_id=BOT_ADMIN,
+                from_chat_id=chat.id,
+                message_id=message.message_id
+            )
+
+        await message.reply_text(
+            "✅ <b>Report Submitted!</b>\n\n"
+            "Thank you for your feedback. The admin has been notified and will review the issue.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        log.exception("Failed to send bug report to admin.")
+        await message.reply_text(
+            "❌ <b>Error:</b> Could not send the report at this time. Please try again later.",
+            parse_mode="HTML"
+        )

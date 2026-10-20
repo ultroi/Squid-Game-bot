@@ -135,33 +135,48 @@ async def _prompt_hide(context, mid, pair):
         hider_marbles = pair["marbles"][str(hider)]
         guesser_marbles = pair["marbles"][str(guesser)]
         hider_name = html.escape(pname(match, hider))
+        
+        hider_player = get_player(match, hider)
+        guesser_player = get_player(match, guesser)
+        hider_dm = hider_player.get("dm_mid") if hider_player else None
+        guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
 
-    try:
-        message = await context.bot.send_message(
-            hider,
-            f"🎱 You are the <b>HIDER</b> (you: {hider_marbles} 🎱 | "
-            f"foe: {guesser_marbles} 🎱)\nHow many marbles do you hide in your fist?",
-            reply_markup=ui.marbles_count_keyboard(mid, "hide", hider_marbles),
-            parse_mode="HTML",
-        )
-        async with rt["lock"]:
-            match = await get_match(mid)
-            get_player(match, hider)["dm_mid"] = message.message_id
-            await save_match(match)
-    except Exception:
-        pass
+    # HIDER DM
+    hider_text = (
+        f"🎱 You are the <b>HIDER</b> (you: {hider_marbles} 🎱 | "
+        f"foe: {guesser_marbles} 🎱)\nHow many marbles do you hide in your fist?"
+    )
+    hider_markup = ui.marbles_count_keyboard(mid, "hide", hider_marbles)
+    
+    if hider_dm:
+        await safe_edit(context.bot, hider, hider_dm, hider_text, reply_markup=hider_markup)
+    else:
+        try:
+            message = await context.bot.send_message(
+                hider, hider_text, reply_markup=hider_markup, parse_mode="HTML"
+            )
+            async with rt["lock"]:
+                match = await get_match(mid)
+                get_player(match, hider)["dm_mid"] = message.message_id
+                await save_match(match)
+        except Exception:
+            pass
 
-    try:
-        message = await context.bot.send_message(
-            guesser, f"🎱 {hider_name} is hiding marbles… get ready to bet!",
-            parse_mode="HTML",
-        )
-        async with rt["lock"]:
-            match = await get_match(mid)
-            get_player(match, guesser)["dm_mid"] = message.message_id
-            await save_match(match)
-    except Exception:
-        pass
+    # GUESSER DM
+    guesser_text = f"🎱 {hider_name} is hiding marbles… get ready to bet!"
+    if guesser_dm:
+        await safe_edit(context.bot, guesser, guesser_dm, guesser_text, reply_markup=ui.kb([]))
+    else:
+        try:
+            message = await context.bot.send_message(
+                guesser, guesser_text, parse_mode="HTML"
+            )
+            async with rt["lock"]:
+                match = await get_match(mid)
+                get_player(match, guesser)["dm_mid"] = message.message_id
+                await save_match(match)
+        except Exception:
+            pass
 
 
 async def on_hide(update, context):
@@ -319,16 +334,30 @@ async def on_guess(update, context):
         return
 
     await safe_answer(q)
+    
+    # If the pair is done, clear the keyboards. Otherwise, keep them clear until _prompt_hide
+    is_done = False
+    async with rt["lock"]:
+        match_check = await get_match(mid)
+        if match_check:
+            pair_check = _find_pair(match_check, uid)
+            if pair_check and pair_check.get("phase") == "done":
+                is_done = True
+
+    markup = ui.kb([]) if is_done else None
+
     if guesser_dm:
-        await safe_edit(context.bot, guesser, guesser_dm, result_text)
+        await safe_edit(context.bot, guesser, guesser_dm, result_text, reply_markup=markup)
     if hider_dm:
-        await safe_edit(context.bot, hider, hider_dm, result_text)
+        await safe_edit(context.bot, hider, hider_dm, result_text, reply_markup=markup)
 
     await _refresh_group(context, mid)
 
     if trigger_check_end:
         await _check_end(context, mid)
     elif trigger_prompt_hide:
+        # Thoda pause taaki players result padh sakein naye prompt aane se pehle
+        await asyncio.sleep(2.0)
         await _prompt_hide(context, mid, next_pair_state)
 
 

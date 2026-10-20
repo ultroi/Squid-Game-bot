@@ -250,26 +250,34 @@ async def _refresh_group_round(context, mid, light=None, event=None, finished=Fa
     rt = runtime.get(mid)
     now = time.monotonic()
     last = rt.get("last_group_refresh", 0)
+    
+    # Agar game chal raha hai aur interval cross nahi hua, toh return karein
     if not force and not finished and (now - last < GROUP_THROTTLE_SECONDS):
         return
+        
     async with rt.setdefault("group_refresh_lock", asyncio.Lock()):
         snapshot = rt.get("match_snapshot") or await get_match(mid)
         if not snapshot or (snapshot.get("stage") != "rlgl" and not finished):
             return
         if not finished and (rt.get("done") or (snapshot.get("game") or {}).get("round_finished")):
             return
+            
         display_event = event if event is not None else (snapshot.get("game") or {}).get("last_event")
+        
         if not finished and reply_markup is None:
             reply_markup = await _open_dm_markup(context, rt)
         elif finished:
             reply_markup = ui.kb([])
+            
         await ui.refresh_round_announcement(
             context.bot, snapshot, "rlgl",
             details=_group_details(snapshot, light),
             event=display_event, finished=finished, reply_markup=reply_markup,
         )
         rt["last_group_refresh"] = time.monotonic()
-    await refresh_lobby_scoreboard(context, mid)
+        
+    if finished or force:
+        await refresh_lobby_scoreboard(context, mid, force=finished)
 
 
 # ---------------------------------------------------------------- begin
@@ -773,7 +781,7 @@ async def _persist_loop(context, mid):
 # ---------------------------------------------------------------- housekeeping
 
 async def _housekeeping_loop(context, mid):
-    """Timer text refresh + trailing-edge group card refresh (never lost to a throttle)."""
+    """Trailing-edge group card refresh without forced spam."""
     rt = runtime.get(mid)
     last_timer = time.monotonic()
     try:
@@ -791,8 +799,9 @@ async def _housekeeping_loop(context, mid):
                     and since_group >= GROUP_THROTTLE_SECONDS:
                 rt["group_dirty"] = False
                 try:
+                    # Update group card only if naturally dirty, don't force it
                     await _refresh_group_round(
-                        context, mid, rt.get("light", "green"), force=True
+                        context, mid, rt.get("light", "green"), force=False 
                     )
                 except asyncio.CancelledError:
                     raise

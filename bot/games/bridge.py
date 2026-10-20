@@ -87,7 +87,7 @@ def _bridge_details(match):
     step = min(config.BRIDGE_LENGTH, max(0, int(g.get("progress", -1)) + 2))
     crossed = len(g.get("crossed", []))
     return (
-        f"<pre>{grid}</pre>\n"
+        f"{grid}\n\n"
         f"🧍 <b>Crossing:</b> {html.escape(str(current))}\n"
         f"📍 <b>Step:</b> {step}/{config.BRIDGE_LENGTH}  ·  ✅ <b>Crossed:</b> {crossed}"
     )
@@ -213,7 +213,11 @@ async def on_pick(update, context):
     if result_kind == "win":
         await safe_answer(q, "✅ Safe!")
         if dm_mid:
-            await safe_edit(context.bot, uid, dm_mid, "🎉 <b>You crossed the bridge!</b>")
+            await safe_edit(
+                context.bot, uid, dm_mid, 
+                "🎉 <b>You crossed the bridge!</b>", 
+                reply_markup=ui.kb([])
+            )
     elif result_kind == "safe":
         await safe_answer(q, "✅ Safe!")
         if dm_mid:
@@ -225,7 +229,11 @@ async def on_pick(update, context):
     elif result_kind == "dead":
         await safe_answer(q, "💥 Wrong glass!", True)
         if dm_mid:
-            await safe_edit(context.bot, uid, dm_mid, "💥💀 <b>The glass shattered. You fell. ELIMINATED.</b>")
+            await safe_edit(
+                context.bot, uid, dm_mid, 
+                "💥💀 <b>The glass shattered. You fell. ELIMINATED.</b>", 
+                reply_markup=ui.kb([])
+            )
 
     await _refresh(context, mid)
     if result_kind in ("win", "dead"):

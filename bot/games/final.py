@@ -16,6 +16,72 @@ BEATS = {"offense": "defense", "defense": "trickster", "trickster": "offense"}
 LABEL = {"offense": "⚔️ Offensive", "defense": "🛡️ Defensive", "trickster": "🃏 Trickster"}
 
 
+async def _bracket_timeout(context, mid, bracket_round_idx):
+    """Wait for a maximum bracket duration, then forcibly resolve incomplete duels."""
+    try:
+        # Strict 60 seconds to finish all duels in the current bracket
+        await asyncio.sleep(60.0)
+    except asyncio.CancelledError:
+        return
+
+    rt = runtime.get(mid)
+    advance_now = False
+
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "final" or match.get("game", {}).get("round_finished"):
+            return
+        
+        game = match["game"]
+        # If the game naturally advanced to the next bracket, do nothing
+        if game.get("bracket_round") != bracket_round_idx:
+            return
+
+        incomplete_duels = False
+        for duel in game.get("duels", []):
+            if duel["winner"] is None:
+                incomplete_duels = True
+                a, b = str(duel["a"]), str(duel["b"])
+                
+                # Determine who failed to pick and penalize them
+                picks = duel.get("picks", {})
+                if a in picks and b not in picks:
+                    winner_uid, loser_uid = a, b
+                elif b in picks and a not in picks:
+                    winner_uid, loser_uid = b, a
+                else:
+                    # Neither picked (or both stuck), choose randomly to unblock the game
+                    winner_uid, loser_uid = random.choice([(a, b), (b, a)])
+
+                duel["winner"] = int(winner_uid)
+                game["winners"].append(int(winner_uid))
+
+                loser_player = get_player(match, int(loser_uid))
+                if loser_player:
+                    loser_player["alive"] = False
+                    dm_mid = loser_player.get("dm_mid")
+                    if dm_mid:
+                        asyncio.create_task(
+                            safe_edit(context.bot, int(loser_uid), dm_mid, "💀 <b>TIME OUT!</b> You failed to act and were eliminated.", reply_markup=ui.kb([]))
+                        )
+
+                winner_player = get_player(match, int(winner_uid))
+                if winner_player:
+                    dm_mid = winner_player.get("dm_mid")
+                    if dm_mid:
+                        asyncio.create_task(
+                            safe_edit(context.bot, int(winner_uid), dm_mid, "⏳ <b>Opponent timed out.</b> You advance by default.", reply_markup=ui.kb([]))
+                        )
+
+        if incomplete_duels:
+            game["last_event"] = "Time expired. Incomplete duels were resolved automatically."
+            await save_match(match)
+            advance_now = True
+
+    if advance_now:
+        await _refresh_group(context, mid)
+        await _advance_bracket(context, mid)
+
 def _final_details(match, seconds_left=None):
     game = match.get("game") or {}
     duels = game.get("duels") or []
@@ -151,16 +217,20 @@ async def _start_bracket_round(context, mid):
         await save_match(match)
         duels_empty = not game["duels"]
         winners_count = len(game["winners"])
+        bracket_round_idx = game["bracket_round"]
 
     await _refresh_group(context, mid)
     if duels_empty and winners_count == 1:
         await _advance_bracket(context, mid)
         return
 
+    # Start the timeout task specifically for this bracket round
+    # We allocate 60 seconds per bracket round
+    runtime.add_task(mid, asyncio.create_task(_bracket_timeout(context, mid, bracket_round_idx)))
+
     match = await get_match(mid)
     for index in range(len(match["game"]["duels"])):
         await _prompt_duel(context, mid, index, intro=True)
-
 
 async def _prompt_duel(context, mid, idx, intro=False):
     rt = runtime.get(mid)
@@ -299,9 +369,9 @@ async def _resolve_exchange(context, mid, idx):
 
     if loser is not None and winner is not None:
         if loser_dm:
-            await safe_edit(context.bot, loser, loser_dm, "💀 You lost the duel. <b>ELIMINATED.</b>")
+            await safe_edit(context.bot, loser, loser_dm, "💀 You lost the duel. <b>ELIMINATED.</b>", reply_markup=ui.kb([]))
         if winner_dm:
-            await safe_edit(context.bot, winner, winner_dm, "🎉 You won the duel! Advancing to the next bracket.")
+            await safe_edit(context.bot, winner, winner_dm, "🎉 You won the duel! Advancing to the next bracket.", reply_markup=ui.kb([]))
 
         await _refresh_group(context, mid)
         if advance_now:

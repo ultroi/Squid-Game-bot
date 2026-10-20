@@ -577,13 +577,17 @@ async def _close_next_round_gate(context, mid, force=False):
     target_stage = None
     entrants_count = 0
     gate_message_id = None
+    chat_id_cache = None
 
     async with rt["lock"]:
         match = await get_match(mid)
         gate = (match or {}).get("next_round") or {}
         if not match or match.get("stage") != "intermission" or gate.get("status") != "open":
             return
+            
         gate_message_id = match.get("next_round_message_id")
+        chat_id_cache = match.get("chat_id")
+        
         # De-duplicate IDs by their string form so legacy documents containing
         # both integer and string representations cannot count one player twice.
         entered_by_id = {str(uid): uid for uid in gate.get("joined_ids", [])}
@@ -643,32 +647,33 @@ async def _close_next_round_gate(context, mid, force=False):
 
     # A successful entry closes and removes the standalone gate message before
     # the next round's fresh announcement is posted.
-    if (target_stage or champion_id is not None) and gate_message_id:
-        await _delete_group_message(context, match["chat_id"], gate_message_id)
+    if (target_stage or champion_id is not None) and gate_message_id and chat_id_cache:
+        await _delete_group_message(context, chat_id_cache, gate_message_id)
 
     if no_entrants:
-        match = await get_match(mid)
-        if match:
-            await refresh_lobby_scoreboard(context, mid, force=True)
-            closed_text = (
-                "🛑 <b>ENTRY WINDOW CLOSED</b>\n\n"
-                "No qualified players entered the next round in time.\n"
-                "🩸 <b>The game is over.</b> Start a new lobby with /enterthehell."
-            )
-            if gate_message_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=match["chat_id"],
-                        message_id=gate_message_id,
-                        text=closed_text,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=ui.kb([]),
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    log.exception("Could not close entry-gate message %s", gate_message_id)
-            else:
-                await _edit_round_card(context, match, closed_text, reply_markup=ui.kb([]))
+        await refresh_lobby_scoreboard(context, mid, force=True)
+        closed_text = (
+            "🛑 <b>ENTRY WINDOW CLOSED</b>\n\n"
+            "No qualified players entered the next round in time.\n"
+            "🩸 <b>The game is over.</b> Start a new lobby with /enterthehell."
+        )
+        if gate_message_id and chat_id_cache:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id_cache,
+                    message_id=gate_message_id,
+                    text=closed_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=ui.kb([]),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                log.exception("Could not close entry-gate message %s", gate_message_id)
+        else:
+            # Fallback if there was no separate gate message
+            # Reconstruct enough of the match dict to send the final card
+            fallback_match = {"chat_id": chat_id_cache, "_id": mid}
+            await _edit_round_card(context, fallback_match, closed_text, reply_markup=ui.kb([]))
         runtime.clear(mid)
         return
 
@@ -899,3 +904,47 @@ async def crown(context, mid, winner_id):
         )
     except Exception:
         pass
+
+
+async def cleanup_interrupted_games(application):
+    """Terminate active games that lost their runtime state due to a restart."""
+    from types import SimpleNamespace
+    from .database import matches
+
+    try:
+        # Fetch any match stuck in an active mini-game stage
+        interrupted = await matches.find({
+            "stage": {"$nin": ["lobby", "intermission", "finished"]}
+        }).to_list(length=1000)
+    except Exception:
+        log.exception("Could not retrieve interrupted games during startup")
+        return
+
+    if not interrupted:
+        return
+
+    context = SimpleNamespace(bot=application.bot)
+    log.info("Cleaning up %s interrupted match(es)...", len(interrupted))
+
+    for match in interrupted:
+        mid = str(match.get("_id", ""))
+        if not mid:
+            continue
+
+        match["stage"] = "finished"
+        match.setdefault("game", {})["round_finished"] = True
+        
+        closed_text = (
+            "🛑 <b>GAME TERMINATED</b>\n\n"
+            "The bot server was restarted for maintenance while this round was in progress.\n"
+            "Please start a new lobby with /enterthehell."
+        )
+        
+        try:
+            # save_match triggers the 60-second delayed deletion because stage is "finished"
+            await save_match(match)
+            runtime.clear(mid)
+            await refresh_lobby_scoreboard(context, mid, force=True)
+            await _edit_round_card(context, match, closed_text, reply_markup=ui.kb([]))
+        except Exception:
+            log.exception("Failed to clean up interrupted match %s", mid)

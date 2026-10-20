@@ -1,6 +1,7 @@
 import asyncio
 import logging
-
+import subprocess
+import html
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -8,7 +9,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
-
+from telegram.ext import ChatMemberHandler
 from bot.config import BOT_TOKEN, LOG_LEVEL
 from bot.database import ensure_indexes, close_database
 from bot.handlers import lobby
@@ -38,7 +39,40 @@ async def post_init(app: Application) -> None:
 
     await restore_lobby_timers(app)
     await manager.resume_pending_next_round_gates(app)
+    await manager.cleanup_interrupted_games(app)
     log.info("Pending next-round gates resumed.")
+
+    # --- STARTUP DEPLOYMENT NOTIFICATION ---
+    try:
+        # Your private updates channel ID
+        UPDATES_CHANNEL = "-1004325447119"
+
+        # Fetch the latest Git commit message
+        try:
+            # Runs 'git log -1 --pretty=format:%s' to get just the commit title
+            commit_msg = subprocess.check_output(
+                ['git', 'log', '-1', '--pretty=format:%s'],
+                stderr=subprocess.STDOUT
+            ).decode('utf-8').strip()
+        except Exception:
+            commit_msg = "System restarted or updated manually."
+
+        # Format the notification message
+        deploy_message = (
+            "🚀 <b>Bot Restarted Successfully</b>\n\n"
+            "🛠 <b>Latest Update:</b>\n"
+            f"<code>{html.escape(commit_msg)}</code>"
+        )
+
+        # Send to the channel
+        await app.bot.send_message(
+            chat_id=UPDATES_CHANNEL,
+            text=deploy_message,
+            parse_mode="HTML"
+        )
+        log.info("Startup notification sent to channel.")
+    except Exception as e:
+        log.warning(f"Could not send startup notification to channel: {e}")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,11 +97,18 @@ def build_application() -> Application:
         .build()
     )
 
+    app.add_handler(ChatMemberHandler(lobby.track_group_memberships, ChatMemberHandler.MY_CHAT_MEMBER))
+
     # Commands
     app.add_handler(CommandHandler("start", lobby.start))
     app.add_handler(CommandHandler("enterthehell", lobby.enter_the_hell))
     app.add_handler(CommandHandler("cancelgame", lobby.cancel_game))
     app.add_handler(CommandHandler("stats", lobby.stats_command))
+    app.add_handler(CommandHandler("help", lobby.help_command))
+    app.add_handler(CommandHandler("report", lobby.report_command))
+
+    # General callbacks
+    app.add_handler(CallbackQueryHandler(lobby.help_callback, pattern=r"^help:"))
 
     # Lobby callbacks
     app.add_handler(CallbackQueryHandler(lobby.on_join, pattern=r"^lob:join:"))

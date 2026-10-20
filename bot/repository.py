@@ -1,7 +1,7 @@
 """All MongoDB access in one place + small match-document helpers."""
 import html
 from datetime import datetime, timezone
-
+import asyncio
 from bson import ObjectId
 from bson.errors import InvalidId
 from pymongo import ReturnDocument
@@ -85,23 +85,29 @@ async def get_match(match_id: str):
         return None
     return await matches.find_one({"_id": object_id})
 
-
 async def save_match(match: dict) -> None:
-    """Persist an existing match or DELETE it if it's finished."""
+    """Persist an existing match and schedule cleanup if it is finished."""
     match_id = match.get("_id")
     if match_id is None:
         raise ValueError("Cannot save a match without _id")
-        
-    # Naya Logic: Agar stage finished hai, toh Mongo se hamesha ke liye uda do
-    if match.get("stage") == "finished":
-        await matches.delete_one({"_id": match_id})
-        return
 
+    # 1. Update the document normally so final UI refreshes can read it
     match["updated_at"] = now()
     fields = {key: value for key, value in match.items() if key != "_id"}
     result = await matches.update_one({"_id": match_id}, {"$set": fields}, upsert=False)
+    
     if result.matched_count == 0:
         raise LookupError(f"Match {match_id} no longer exists in MongoDB")
+
+    # 2. Delayed Cleanup: If finished, wipe it from MongoDB after 60 seconds
+    if match.get("stage") == "finished":
+        async def delayed_delete():
+            await asyncio.sleep(60)  # Give the UI plenty of time to send final notices
+            await matches.delete_one({"_id": match_id})
+            
+        asyncio.create_task(delayed_delete())
+
+        
 
 async def save_rlgl_players(match_id: str, players: list, last_event: str = None) -> None:
     """One focused write: only `players` + `game.last_event` + `updated_at`."""
@@ -160,10 +166,9 @@ async def get_bot_stats() -> dict:
     
     return {
         "total_games": stats.get("total_games", 0),
-        # Active games sirf wo hain jo lobby ke aage badh chuke hain
         "active_games": await matches.count_documents({"stage": {"$ne": "lobby"}}),
         "total_users": await users.estimated_document_count(),
-        "total_groups": await groups.estimated_document_count()
+        "total_groups": await groups.count_documents({"active": True})
     }
 
 
