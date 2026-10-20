@@ -1,0 +1,25 @@
+user:
+  name: Akshay
+  github: ultroi
+
+runtime:
+  name: python
+  version: "3.11"
+  image: python:3.11-slim
+
+commands:
+  package: ""
+  build:
+    - pip install -r requirements.txt
+  start: "python main.py"
+
+repository:
+  branch: main
+  auto_deploy: true
+
+env:
+  - BOT_TOKEN:BOT_TOKEN
+  - MONGODB_URI:MONGODB_URI
+  - DB_NAME=squid_game_bot
+  - LOG_LEVEL=INFO
+  - WELCOME_VIDEO=assets/welcome.mp4
