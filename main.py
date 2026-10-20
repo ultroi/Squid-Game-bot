@@ -2,6 +2,7 @@ import asyncio
 import logging
 import subprocess
 import html
+import os
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -31,6 +32,58 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("squid-game-bot")
+
+
+async def _handle_health_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Minimal HTTP endpoint required by Render Web Services."""
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5)
+        if not request_line:
+            return
+
+        parts = request_line.decode("latin-1", errors="replace").strip().split()
+        path = parts[1].split("?", 1)[0] if len(parts) >= 2 else "/"
+
+        # Consume headers so the connection is handled cleanly.
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+        if path == "/health":
+            status = "200 OK"
+            body = b"OK\n"
+        elif path == "/":
+            status = "200 OK"
+            body = b"Squid Game Bot is running\n"
+        else:
+            status = "404 Not Found"
+            body = b"Not Found\n"
+
+        response = (
+            f"HTTP/1.1 {status}\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii") + body
+        writer.write(response)
+        await writer.drain()
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+
+
+async def start_health_server() -> asyncio.AbstractServer:
+    """Bind the HTTP health endpoint to the port supplied by Render."""
+    port = int(os.environ.get("PORT", "10000"))
+    server = await asyncio.start_server(_handle_health_request, "0.0.0.0", port)
+    log.info("Health server listening on 0.0.0.0:%s", port)
+    return server
 
 
 async def post_init(app: Application) -> None:
@@ -131,9 +184,13 @@ def build_application() -> Application:
 
 
 async def async_main() -> None:
+    # Render Web Services require an open HTTP port. This lightweight server
+    # runs alongside Telegram polling and exposes /health for UptimeRobot.
+    health_server = await start_health_server()
     app = build_application()
-    await app.initialize()
     try:
+        await app.initialize()
+
         # With this custom lifecycle, invoke post_init explicitly after initialize().
         if app.post_init:
             await app.post_init(app)
@@ -158,6 +215,8 @@ async def async_main() -> None:
             await app.stop()
         await app.shutdown()
         close_database()
+        health_server.close()
+        await health_server.wait_closed()
 
 
 def main() -> None:
