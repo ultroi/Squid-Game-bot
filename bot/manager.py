@@ -14,6 +14,14 @@ log = logging.getLogger(__name__)
 
 # ---------- messaging helpers ----------
 
+async def delayed_unpin_board(context, chat_id, message_id, delay=4.0):
+    """Match khatam hone ke 4 seconds baad scoreboard/board message ko unpin karega."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        log.debug("Could not unpin match board message", exc_info=True)
+
 async def group_send(context, match, text, **kwargs):
     for attempt in range(2):
         try:
@@ -455,8 +463,10 @@ async def game_finished(context, mid, survivor_ids, title):
         match["next_round"] = {"status": "closed", "from_stage": previous_stage}
         await save_match(match)
 
-        # A card edit can fail without showing the result. Guarantee a plain
-        # group-message fallback when zero players survive any round.
+        scoreboard_id = match.get("scoreboard_message_id")
+        if scoreboard_id:
+            asyncio.create_task(delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0))
+            
         game_state = match.get("game") or {}
         if not game_state.get("final_group_result_message_id"):
             result = (match.get("round_results") or {}).get(previous_stage) or {}
@@ -931,6 +941,12 @@ async def crown(context, mid, winner_id):
         
     await save_match(match)
     await refresh_lobby_scoreboard(context, mid, force=True)
+    
+    # 🟢 Match board unpin with a 4-second delay after winning
+    scoreboard_id = match.get("scoreboard_message_id")
+    if scoreboard_id:
+        asyncio.create_task(delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0))
+
     runtime.clear(mid)
     await add_win(winner_id)
 
@@ -942,7 +958,6 @@ async def crown(context, mid, winner_id):
         "🩸 The games are over. Use /enterthehell to play again."
     )
     
-    # FIX: Purana message edit karne ke bajay humesha ek NAYA message bhejein
     try:
         message = await group_send(context, match, text, reply_markup=ui.kb([]))
         if message:
@@ -951,13 +966,6 @@ async def crown(context, mid, winner_id):
     except Exception as e:
         log.exception("Failed to send champion message: %s", e)
 
-    try:
-        await context.bot.send_message(
-            winner_id,
-            "🏆 Congratulations! You are the Squid Game champion!",
-        )
-    except Exception:
-        pass
 
 
 async def cleanup_interrupted_games(application):

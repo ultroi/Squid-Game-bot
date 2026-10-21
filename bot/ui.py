@@ -18,7 +18,7 @@ NUM = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣",
 GREEN_IMG = "https://i.ibb.co/TMkY47Sp/19d2bbda-8ea1-468f-a7d2-a3d805d67b2e.jpg"
 RED_IMG = "https://i.ibb.co/gp8gt2s/41768240-4fc8-4ad9-ac41-9aaba8325c8d.jpg"
 
-# Round artwork is embedded into the announcement's Rich Message HTML.
+# Round artwork is sent as a regular Telegram photo above the text announcement.
 # ``bridge`` is the existing stage key for the Hopscotch / Glass Bridge round.
 ROUND_ANNOUNCEMENT_IMAGES = {
     "rlgl": "https://i.ibb.co/RtTGDPF/0d120550-9d01-4732-a898-db1ca770a047.jpg",
@@ -29,17 +29,18 @@ ROUND_ANNOUNCEMENT_IMAGES = {
     "final": "https://i.ibb.co/C5xQQZby/31f3f3f0-aae7-4c1a-8723-de96c6e53fe0.jpg",
 }
 
-
-
-def _validate_rich_image_url(image_url):
+def _validate_image_url(image_url):
     if not isinstance(image_url, str) or not image_url.strip():
         raise ValueError("image_url must be a non-empty HTTP(S) URL")
     image_url = image_url.strip()
     parsed = urlsplit(image_url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Rich HTML media URLs must use HTTP or HTTPS")
+        raise ValueError("Image URLs must use HTTP or HTTPS")
     return image_url
 
+
+def _validate_rich_image_url(image_url):
+    return _validate_image_url(image_url)
 
 
 def _input_rich_message(rich_html, media=None):
@@ -51,6 +52,12 @@ def _input_rich_message(rich_html, media=None):
     return payload
 
 
+def open_dm_keyboard(bot_username, label="📩 Open Bot DM"):
+    username = str(bot_username or "").strip().lstrip("@")
+    if not username:
+        return kb([])
+    return kb([[InlineKeyboardButton(label, url=f"https://t.me/{username}")]])
+
 def btn(text, data):
     return InlineKeyboardButton(text, callback_data=data)
 
@@ -59,18 +66,26 @@ def kb(rows):
     return InlineKeyboardMarkup(rows)
 
 
-def lobby_keyboard(match_id, can_start):
-    rows = [[btn("🙋 Join", f"lob:join:{match_id}")]]
+def lobby_keyboard(match_id, can_start, seconds_left=None):
+    rows = [
+        [
+            btn("🙋 Join", f"lob:join:{match_id}"),
+            btn("🚪 Leave", f"lob:leave:{match_id}"),
+        ]
+    ]
+
+    action_row = []
     if can_start:
-        rows.append([btn("▶️ Start Now", f"lob:start:{match_id}")])
+        action_row.append(btn("▶️ Start Now", f"lob:start:{match_id}"))
+
+    # Strictly < 10 seconds remaining
+    if seconds_left is not None and 0 < int(seconds_left) < 10:
+        action_row.append(btn("⏱ +10s", f"lob:time:{match_id}"))
+
+    if action_row:
+        rows.append(action_row)
+
     return kb(rows)
-
-
-def open_dm_keyboard(bot_username, label="📩 Open Bot DM"):
-    username = str(bot_username or "").strip().lstrip("@")
-    if not username:
-        return kb([])
-    return kb([[InlineKeyboardButton(label, url=f"https://t.me/{username}")]])
 
 
 ROUND_INFO = {
@@ -114,7 +129,7 @@ def round_waiting_panel(stage, seconds_left, *, total_seconds=30, hint=None):
     total = max(1, int(total_seconds))
     remaining = max(0, min(total, int(seconds_left)))
     completed_blocks = max(0, min(10, round((total - remaining) / total * 10)))
-    progress_bar = "🟩" * completed_blocks + "⬜" * (10 - completed_blocks)
+    progress_bar = "▰" * completed_blocks + "▱" * (10 - completed_blocks)
     if remaining > 0:
         countdown = f"⏳ <b>Starting in</b> <code>{remaining:02d}s</code>"
     else:
@@ -122,7 +137,6 @@ def round_waiting_panel(stage, seconds_left, *, total_seconds=30, hint=None):
 
     instruction = hint or ROUND_WAITING_HINTS.get(
         str(stage or "").lower(),
-        "Stay ready ",
     )
     return "\n".join((
         "🎮 <b>ROUND PREPARATION</b>",
@@ -306,8 +320,6 @@ def _match_board_text(match):
     return "\n".join(lines)
 
 
-
-
 def render_lobby(match, seconds_left=None, min_players=None, max_players=None):
     if match.get("current_round_stage") or match.get("round_results"):
         return _match_board_text(match)
@@ -370,36 +382,76 @@ def render_lobby(match, seconds_left=None, min_players=None, max_players=None):
     return "\n".join(lines)
 
 
-def _round_result_block(match, stage):
-    """Build the qualified/eliminated summary shown when a round ends."""
+
+
+def round_result_text(match, stage, event=None):
+    """Sabhi rounds ke liye proper formatted standalone result message."""
+    round_number, title, _ = ROUND_INFO.get(
+        stage, (0, str(stage).replace("_", " ").upper(), "")
+    )
     players = match.get("players") or []
+    
+    # Current round ke participants filter karein taaki pichle round ke dead players mix na hon
+    participants = {str(uid) for uid in (match.get("current_round_player_ids") or [])}
+    if not participants:
+        game_players = (match.get("game") or {}).get("players")
+        if isinstance(game_players, dict) and game_players:
+            participants = {str(uid) for uid in game_players.keys()}
+
+    def in_round(p):
+        return not participants or str(p.get("id")) in participants
+
+    def format_player_link(p):
+        """Helper to format player name as a Telegram profile hyperlink."""
+        uid = p.get("id") or p.get("user_id")
+        name = html.escape(str(p.get("name") or p.get("display_name") or uid))
+        if uid:
+            return f'<a href="tg://user?id={uid}">{name}</a>'
+        return name
+
     if stage == "rlgl":
         qualified = [
-            html.escape(str(player.get("name") or player.get("id")))
-            for player in players if player.get("reached")
+            format_player_link(p)
+            for p in players if in_round(p) and p.get("reached")
         ]
         eliminated = [
-            html.escape(str(player.get("name") or player.get("id")))
-            for player in players
-            if not player.get("alive") and not player.get("reached")
+            format_player_link(p)
+            for p in players if in_round(p) and not p.get("alive") and not p.get("reached")
         ]
     else:
         qualified = [
-            html.escape(str(player.get("name") or player.get("id")))
-            for player in players if player.get("alive")
+            format_player_link(p)
+            for p in players if in_round(p) and p.get("alive")
         ]
         eliminated = [
-            html.escape(str(player.get("name") or player.get("id")))
-            for player in players if not player.get("alive")
+            format_player_link(p)
+            for p in players if in_round(p) and not p.get("alive")
         ]
 
     qualified_text = ", ".join(qualified) if qualified else "None"
     eliminated_text = ", ".join(eliminated) if eliminated else "None"
-    return (
-        f"\n\n📊 <b>RESULTS</b>\n"
-        f"✅ <b>Qualified ({len(qualified)}):</b> {qualified_text}\n"
-        f"💀 <b>Eliminated ({len(eliminated)}):</b> {eliminated_text}"
+
+    heading = (
+        f"🏁 <b>ROUND {round_number} RESULT</b>"
+        if round_number else f"🏁 <b>{html.escape(title)} — RESULTS</b>"
     )
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        heading,
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"✅ <b>Qualified ({len(qualified)}):</b>\n{qualified_text}",
+        f"💀 <b>Eliminated ({len(eliminated)}):</b>\n{eliminated_text}",
+    ]
+
+    if event:
+        lines.extend(["", f"📣 <i>{html.escape(str(event))}</i>"])
+
+    if not qualified:
+        lines.extend(["", "❌ <b>No one qualified.</b> The match is over."])
+
+    return "\n".join(lines)
 
 
 def round_status_text(match, stage, details=None, event=None, finished=False):
@@ -428,31 +480,20 @@ def round_status_text(match, stage, details=None, event=None, finished=False):
     else:
         stats_line = f"👥 <b>Alive:</b> {alive_count}  |  💀 <b>Out:</b> {eliminated}  |  📊 <b>Total:</b> {total}"
 
-    # 4. Structured Additional Blocks
-    details_block = f"\n\n👇 <b>Round Details:</b>\n{details}" if details else ""
-    
-    event_block = (
-        f"\n\n📣 <b>Live Update:</b>\n<i>{html.escape(str(event)[:140])}</i>"
-        if event and not finished else ""
-    )
-    
-    results_block = _round_result_block(match, stage) if finished else ""
+    # 4. Structured Additional Blocks (Result block yahan se hata diya gaya hai taaki announcement me result add na ho)
+    details_block = f"\n\n{details}" if details else ""
 
-    # Assemble everything with clear visual breaks
     return (
         f"{heading}\n"
         f"<i>{html.escape(description)}</i>\n\n"
         f"{status_line}\n"
         f"{stats_line}"
         f"{details_block}"
-        f"{event_block}"
-        f"{results_block}"
     )
 
 
-
 def next_round_keyboard(match_id):
-    return kb([[btn("✅ ENTER NEXT ROUND", f"nr:enter:{match_id}")]])
+    return kb([[btn("✅ Enter Next Round", f"nr:enter:{match_id}")]])
 
 
 def next_round_gate_text(match, seconds_left=None):
@@ -508,54 +549,23 @@ def round_preparation_text(stage, entrants_count, seconds_left):
         f"⏳ <b>Starting in {seconds_left}s…</b>"
     )
 
-
-def _round_announcement_html(stage, text):
-    """Render round artwork and text as separate Rich Message blocks."""
-    image_url = ROUND_ANNOUNCEMENT_IMAGES.get(
-        str(stage or "").lower()
-    )
-
-    if not image_url:
-        return text
-
-    image_url = _validate_rich_image_url(image_url)
-    image_block = (
-        f'<img src="{html.escape(image_url, quote=True)}"/>'
-    )
-
-    paragraphs = []
-
-    for line in str(text or "").splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        paragraphs.append(f"<p>{line}</p>")
-
-    return image_block + "".join(paragraphs)
-
-
-def _has_round_announcement_image(stage):
-    return str(stage or "").lower() in ROUND_ANNOUNCEMENT_IMAGES
-
-
-async def _send_round_message(bot, chat_id, stage, text, reply_markup=None):
-    """Send a text announcement or an image+text Rich Message for mapped stages."""
-    if _has_round_announcement_image(stage):
-        rich_html = _round_announcement_html(stage, text)
-        options = {}
-        if reply_markup is not None:
-            options["reply_markup"] = reply_markup
-        result = await send_rich_message(bot, chat_id, rich_html, **options)
-        message_id = (
-            result.get("message_id") if isinstance(result, dict)
-            else getattr(result, "message_id", None)
-        )
-        if not message_id:
-            raise RuntimeError("Rich round announcement returned no message_id")
-        from types import SimpleNamespace
-        return SimpleNamespace(message_id=message_id, chat_id=chat_id)
+async def _send_round_message(
+    bot, chat_id, stage, text, reply_markup=None, *, include_banner=False
+):
+    """Send a Telegram message for a round announcement with an attached photo banner and caption."""
+    image_url = ROUND_ANNOUNCEMENT_IMAGES.get(str(stage or "").lower()) if include_banner else None
+    
+    if image_url:
+        try:
+            return await bot.send_photo(
+                chat_id=chat_id,
+                photo=_validate_image_url(image_url),
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+        except TelegramError as exc:
+            log.warning("Round announcement photo banner failed for %s, falling back to text: %s", stage, exc)
 
     return await bot.send_message(
         chat_id=chat_id,
@@ -565,36 +575,53 @@ async def _send_round_message(bot, chat_id, stage, text, reply_markup=None):
         disable_web_page_preview=True,
     )
 
-
 async def _edit_round_message(bot, chat_id, message_id, stage, text, reply_markup=None):
-    """Edit using the same transport the original round message was sent with."""
-    if _has_round_announcement_image(stage):
-        rich_html = _round_announcement_html(stage, text)
-        options = {}
-        if reply_markup is not None:
-            options["reply_markup"] = reply_markup
-        return await edit_rich_message(
-            bot, chat_id, message_id, rich_html, **options
+    """Update a round announcement. Safely updates caption if it's a photo message, otherwise updates text."""
+    try:
+        # 1. Try editing the photo caption first
+        return await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
         )
-
-    return await bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=message_id,
-        text=text,
-        parse_mode="HTML",
-        reply_markup=reply_markup,
-        disable_web_page_preview=True,
-    )
-
+    except BadRequest as exc:
+        err_msg = str(exc).lower()
+        # If the caption is identical, do nothing and return True!
+        if "message is not modified" in err_msg:
+            return True
+        
+        # Only fall back to edit_message_text if the message is actually a text message (not a photo)
+        if "no caption in the message to edit" in err_msg or "message_id_invalid" not in err_msg:
+            try:
+                return await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest as text_exc:
+                if "message is not modified" in str(text_exc).lower():
+                    return True
+                raise
+        raise
 
 async def send_round_announcement(bot, match, stage, details=None, event=None, reply_markup=None):
-    """Always post a fresh announcement; mapped stages include their image inline."""
+    """Post a normal editable announcement, preceded by a regular photo banner."""
     text = round_status_text(match, stage, details=details, event=event)
     message = None
     for attempt in range(2):
         try:
             message = await _send_round_message(
-                bot, match["chat_id"], stage, text, reply_markup=reply_markup
+                bot,
+                match["chat_id"],
+                stage,
+                text,
+                reply_markup=reply_markup,
+                include_banner=(attempt == 0),
             )
             break
         except RetryAfter as exc:
@@ -621,13 +648,53 @@ async def send_round_announcement(bot, match, stage, details=None, event=None, r
     return message
 
 
+async def send_round_result_message(bot, match, stage=None, event=None):
+    """Har round ka result ek naye standalone message me GC ke andar bhejega."""
+    stage = stage or match.get("round_message_stage") or match.get("stage", "unknown")
+    
+    # Duplicate result message jane se rokein
+    if (
+        match.get("round_result_message_id")
+        and match.get("round_result_message_stage") == stage
+    ):
+        return True
+
+    text = round_result_text(match, stage, event=event)
+    for attempt in range(3):
+        try:
+            message = await bot.send_message(
+                chat_id=match["chat_id"],
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            match["round_result_message_id"] = message.message_id
+            match["round_result_message_stage"] = stage
+            from .repository import save_match
+            await save_match(match)
+            return True
+        except RetryAfter as exc:
+            delay = getattr(exc, "retry_after", 1)
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            if attempt < 2:
+                await asyncio.sleep(max(0.0, float(delay)) + 0.2)
+                continue
+        except TelegramError:
+            log.exception("Could not send round result message for %s", stage)
+            break
+    return False
+
+
 async def refresh_round_announcement(bot, match, stage=None, details=None, event=None, finished=False, reply_markup=None):
     stage = stage or match.get("round_message_stage") or match.get("stage", "unknown")
-    text = round_status_text(match, stage, details=details, event=event, finished=finished)
+    if finished:
+        return await send_round_result_message(bot, match, stage=stage, event=event)
+
+    text = round_status_text(match, stage, details=details, event=event, finished=False)
     message_id = match.get("round_message_id")
 
     if not message_id:
-        # A missing active card should not block gameplay announcements.
         message = await _send_round_message(
             bot, match["chat_id"], stage, text, reply_markup=reply_markup
         )
@@ -637,7 +704,6 @@ async def refresh_round_announcement(bot, match, stage=None, details=None, event
         await save_match(match)
         return True
 
-    # Same message ko edit karega chahe game chal raha ho ya khatam ho gaya ho
     for attempt in range(2):
         try:
             await _edit_round_message(

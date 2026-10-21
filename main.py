@@ -169,6 +169,9 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(lobby.on_join, pattern=r"^lob:join:"))
     app.add_handler(CallbackQueryHandler(lobby.on_start_game, pattern=r"^lob:start:"))
 
+    app.add_handler(CallbackQueryHandler(lobby.on_leave, pattern=r"^lob:leave:"))
+    app.add_handler(CallbackQueryHandler(lobby.on_add_time, pattern=r"^lob:time:"))
+
     # Game callbacks
     app.add_handler(CallbackQueryHandler(rlgl.on_move, pattern=r"^rlgl:"))
     app.add_handler(CallbackQueryHandler(dalgona.on_press, pattern=r"^dal:"))

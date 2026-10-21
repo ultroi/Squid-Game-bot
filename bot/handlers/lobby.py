@@ -206,7 +206,7 @@ async def _refresh_lobby(context, match, seconds_left=None):
             match["chat_id"],
             match["lobby_message_id"],
             _lobby_text(match, seconds_left),
-            reply_markup=ui.lobby_keyboard(mid, can_start),
+            reply_markup=ui.lobby_keyboard(mid, can_start, seconds_left),
         )
     except Exception:
         log.exception("Could not refresh lobby message for match %s", mid)
@@ -238,7 +238,11 @@ async def enter_the_hell(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 msg = await message.reply_text(
                     _lobby_text(match, config.LOBBY_SECONDS),
-                    reply_markup=ui.lobby_keyboard(mid, len(match.get("players", [])) >= config.MIN_PLAYERS),
+                    reply_markup=ui.lobby_keyboard(
+                        mid,
+                        len(match.get("players", [])) >= config.MIN_PLAYERS,
+                        config.LOBBY_SECONDS,
+                    ),
                     parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
@@ -321,6 +325,147 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _refresh_lobby(context, match)
 
 
+async def on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != "lob" or parts[1] != "leave":
+        await safe_answer(q, "Invalid lobby button.", True)
+        return
+    mid = parts[2]
+    uid = q.from_user.id
+    rt = runtime.get(mid)
+
+    async with rt.setdefault("lobby_lock", asyncio.Lock()):
+        match = await get_match(mid)
+        if not match or match.get("stage") != "lobby":
+            response = ("Lobby is closed.", True)
+        elif _lobby_seconds_left(match) <= 0:
+            response = ("Lobby timer has expired. Please wait for it to close.", True)
+        else:
+            players = match.get("players", [])
+            # Check if user is in players list
+            player_exists = any(p.get("id") == uid for p in players)
+            
+            if not player_exists:
+                response = ("You haven't joined the game yet! 👥", False)
+            else:
+                # Remove the player
+                match["players"] = [p for p in players if p.get("id") != uid]
+                await save_match(match)
+                response = ("You left the game! 🚪", False)
+
+    await safe_answer(q, response[0], response[1])
+    if response[0].startswith("You left"):
+        match = await get_match(mid)
+        if match:
+            await _refresh_lobby(context, match)
+
+
+async def on_add_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = (q.data or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != "lob" or parts[1] != "time":
+        await safe_answer(q, "Invalid lobby button.", True)
+        return
+    mid = parts[2]
+    rt = runtime.get(mid)
+
+    async with rt.setdefault("lobby_lock", asyncio.Lock()):
+        match = await get_match(mid)
+        if not match or match.get("stage") != "lobby":
+            response = ("Lobby is closed.", True)
+        else:
+            remaining = _lobby_seconds_left(match)
+            if remaining <= 0:
+                response = ("Lobby timer has expired.", True)
+            elif remaining >= 10:
+                response = ("Wait until less than 10 seconds remain to add time.", True)
+            else:
+                current_deadline = match.get("lobby_deadline")
+                if current_deadline:
+                    match["lobby_deadline"] = float(current_deadline) + 10.0
+                    await save_match(match)
+                    response = ("Added +10 seconds! ⏱", False)
+                else:
+                    response = ("Could not add time.", True)
+
+    await safe_answer(q, response[0], response[1])
+    if response[0].startswith("Added"):
+        match = await get_match(mid)
+        if match:
+            await _refresh_lobby(context, match)
+
+
+async def _lobby_countdown(context, mid):
+    """Refresh the lobby until its persisted deadline, waking up right at 9s so the +10s button appears."""
+    try:
+        while True:
+            match = await get_match(mid)
+            if not match or match.get("stage") != "lobby":
+                return
+            remaining = _lobby_seconds_left(match)
+            if remaining <= 0:
+                break
+            await _refresh_lobby(context, match, remaining)
+            
+            # Ensure we wake up right when remaining hits 9s (< 10s) so +10s button appears on time
+            if remaining > 9:
+                sleep_for = min(5, remaining - 9)
+            else:
+                sleep_for = min(3, remaining)
+            await asyncio.sleep(max(1, sleep_for))
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Unexpected error in lobby countdown loop for match %s", mid)
+        return
+
+    rt = runtime.get(mid)
+    async with rt.setdefault("lobby_lock", asyncio.Lock()):
+        match = await get_match(mid)
+        if not match or match.get("stage") != "lobby":
+            return
+        # Re-check remaining inside lobby_lock in case someone clicked +10s at the last second!
+        if _lobby_seconds_left(match) > 0:
+            runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
+            return
+            
+        players_count = len(match.get("players", []))
+        if players_count >= config.MIN_PLAYERS:
+            try:
+                await advance(context, mid)
+            except Exception:
+                log.exception("Failed to auto-advance game %s", mid)
+                latest = await get_match(mid)
+                if latest and latest.get("stage") != "finished":
+                    latest["stage"] = "finished"
+                    await save_match(latest)
+                    runtime.clear(mid)
+                    await refresh_lobby_scoreboard(context, mid, force=True)
+                    try:
+                        await safe_edit(
+                            context.bot,
+                            latest["chat_id"],
+                            latest.get("round_message_id") or latest.get("lobby_message_id"),
+                            "⚠️ <b>FAILED TO START GAME</b>\n\nThe round could not initialize. Start a new lobby with /enterthehell.",
+                            reply_markup=ui.kb([]),
+                        )
+                    except Exception:
+                        log.exception("Failed to display lobby timeout error for match %s", mid)
+        else:
+            match["stage"] = "finished"
+            await save_match(match)
+            runtime.clear(mid)
+            await safe_edit(
+                context.bot,
+                match["chat_id"],
+                match.get("lobby_message_id"),
+                "🛑 <b>LOBBY CLOSED</b>\n\n"
+                f"Only {players_count}/{config.MIN_PLAYERS} required players joined.\n"
+                "Start a new lobby with /enterthehell when everyone is ready.",
+                reply_markup=ui.kb([]),
+            )
+
 async def on_start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     parts = (q.data or "").split(":", 2)
@@ -362,68 +507,6 @@ async def on_start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if response is not None:
         await safe_answer(q, response[0], response[1])
-
-
-async def _lobby_countdown(context, mid):
-    """Refresh the lobby until its persisted deadline, then transition once."""
-    try:
-        while True:
-            match = await get_match(mid)
-            if not match or match.get("stage") != "lobby":
-                return
-            remaining = _lobby_seconds_left(match)
-            if remaining <= 0:
-                break
-            await _refresh_lobby(context, match, remaining)
-            await asyncio.sleep(min(5, remaining))
-    except asyncio.CancelledError:
-        return
-    except Exception:
-        log.exception("Unexpected error in lobby countdown loop for match %s", mid)
-        return
-
-    rt = runtime.get(mid)
-    async with rt.setdefault("lobby_lock", asyncio.Lock()):
-        match = await get_match(mid)
-        if not match or match.get("stage") != "lobby":
-            return
-        players_count = len(match.get("players", []))
-        if players_count >= config.MIN_PLAYERS:
-            try:
-                # advance() changes stage before starting the first game, so any
-                # duplicate timeout/start callback will observe a non-lobby stage.
-                await advance(context, mid)
-            except Exception:
-                log.exception("Failed to auto-advance game %s", mid)
-                latest = await get_match(mid)
-                if latest and latest.get("stage") != "finished":
-                    latest["stage"] = "finished"
-                    await save_match(latest)
-                    runtime.clear(mid)
-                    await refresh_lobby_scoreboard(context, mid, force=True)
-                    try:
-                        await safe_edit(
-                            context.bot,
-                            latest["chat_id"],
-                            latest.get("round_message_id") or latest.get("lobby_message_id"),
-                            "⚠️ <b>FAILED TO START GAME</b>\n\nThe round could not initialize. Start a new lobby with /enterthehell.",
-                            reply_markup=ui.kb([]),
-                        )
-                    except Exception:
-                        log.exception("Failed to display lobby timeout error for match %s", mid)
-        else:
-            match["stage"] = "finished"
-            await save_match(match)
-            runtime.clear(mid)
-            await safe_edit(
-                context.bot,
-                match["chat_id"],
-                match.get("lobby_message_id"),
-                "🛑 <b>LOBBY CLOSED</b>\n\n"
-                f"Only {players_count}/{config.MIN_PLAYERS} required players joined.\n"
-                "Start a new lobby with /enterthehell when everyone is ready.",
-                reply_markup=ui.kb([]),
-            )
 
 
 async def restore_lobby_timers(context):

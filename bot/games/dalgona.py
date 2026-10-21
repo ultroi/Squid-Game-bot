@@ -18,7 +18,7 @@ GROUP_SHAPES = [
 ]
 FLASH_SECONDS = 1
 DM_READY_SECONDS = 5
-PREPARATION_SECONDS = 30
+PREPARATION_SECONDS = 15
 
 
 def _state_lock(mid: str) -> asyncio.Lock:
@@ -105,13 +105,6 @@ async def _set_board(context, match: dict, shape_name: str, emoji: str, sequence
 
 
 async def _edit_board_markup(context, chat_id: int, board_id: int, mid: str, seq_len: int, active_cell: int | None) -> bool:
-    """Edit one flash; never advance past a tile that Telegram has not accepted.
-
-    RetryAfter includes the server-requested wait. Retrying the same markup
-    after that wait preserves the sequence instead of silently skipping a tile.
-    False means a non-rate-limit failure occurred and the caller must restart
-    the full pattern rather than ask players to reproduce an unseen sequence.
-    """
     markup = ui.dalgona_display_keyboard(mid, seq_len, active_cell=active_cell)
     while True:
         try:
@@ -360,6 +353,7 @@ async def _run_game(context, mid: str) -> None:
                 await save_match(match)
             survivors = [player for player in match.get('players', []) if player.get('alive', True)]
             result_str = f'<b>{emoji} {shape_name} Results:</b>\n✅ {len(survivors)} Survived\n💀 {timed_out_count} Eliminated'
+            await _delete_previous_dm_prompt(context, mid)
             await _refresh_group(context, mid, event=result_str, finished=True)
             await asyncio.sleep(2.0)
 
@@ -471,9 +465,9 @@ async def _send_final_group_result(context, match: dict, survivors: list[int]) -
     eliminated_players = [player for player in players if str(player.get('id')) in participant_ids and str(player.get('id')) not in qualified_ids]
     qualified_names = ', '.join((html.escape(str(player.get('name') or player.get('id'))) for player in qualified_players)) or 'None'
     eliminated_names = ', '.join((html.escape(str(player.get('name') or player.get('id'))) for player in eliminated_players)) or 'None'
-    lines = ['🍪 <b>DALGONA CANDY — FINAL RESULTS</b>', '', f'✅ <b>Qualified ({len(qualified_players)}):</b> {qualified_names}', f'💀 <b>Eliminated ({len(eliminated_players)}):</b> {eliminated_names}']
+    lines = ['🍪 <b>DALGONA CANDY - Result</b>', '', f'✅ <b>Qualified ({len(qualified_players)}):</b> {qualified_names}', f'💀 <b>Eliminated ({len(eliminated_players)}):</b> {eliminated_names}']
     if not qualified_players:
-        lines.extend(['', '❌ <b>No one qualified.</b>', 'The match is over; no next-round entry will open.'])
+        lines.extend(['', '❌ <b>No one qualified.</b>', 'The match is over.'])
     else:
         lines.extend(['', '➡️ Qualified players can enter the next round from the group message.'])
     for attempt in range(3):
@@ -501,6 +495,7 @@ async def _send_final_group_result(context, match: dict, survivors: list[int]) -
 
 async def _finish(context, mid: str, survivors: list[int]) -> None:
     """Finalize Dalgona, publish results, and continue the manager lifecycle."""
+    await _delete_previous_dm_prompt(context, mid)
     match = await get_match(mid)
     if not match or match.get('stage') != 'dalgona':
         return

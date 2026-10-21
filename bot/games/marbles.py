@@ -7,7 +7,7 @@ from .. import config, runtime, ui
 from ..manager import safe_edit, safe_answer, game_finished
 from ..repository import get_match, save_match, alive, get_player, pname
 
-PREPARATION_SECONDS = 30
+PREPARATION_SECONDS = 15
 
 
 def _other(pair, uid):

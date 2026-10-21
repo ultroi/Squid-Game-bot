@@ -10,7 +10,7 @@ from ..repository import get_match, save_match, alive, get_player, pname
 
 log = logging.getLogger(__name__)
 
-PREPARATION_SECONDS = 30
+PREPARATION_SECONDS = 15
 
 
 async def begin(context, mid):

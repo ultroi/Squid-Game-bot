@@ -10,7 +10,7 @@ from ..repository import get_match, save_match, alive, get_player, pname
 
 log = logging.getLogger(__name__)
 
-PREPARATION_SECONDS = 30
+PREPARATION_SECONDS = 15
 
 BEATS = {"offense": "defense", "defense": "trickster", "trickster": "offense"}
 LABEL = {"offense": "⚔️ Offensive", "defense": "🛡️ Defensive", "trickster": "🃏 Trickster"}
