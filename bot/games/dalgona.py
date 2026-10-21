@@ -54,23 +54,24 @@ def _group_details(match: dict, seconds_left: int=None) -> str:
     phase = game.get('sequence_phase')
     shape_idx = game.get('current_shape_index', 0)
     text = []
-    timer_text = None
     if phase == 'preparation':
+        text.append(ui.round_waiting_panel(
+            'dalgona',
+            PREPARATION_SECONDS if seconds_left is None else seconds_left,
+            total_seconds=PREPARATION_SECONDS,
+        ))
         text.append(f'👥 <b>Players ({len(alive_players)}):</b>\n{_player_list_html(alive_players)}')
-        timer_text = f'⏳ <b>Round starts in {seconds_left or 0}s</b>'
     elif phase == 'showing':
         shape_name, _, emoji = GROUP_SHAPES[shape_idx]
-        text.append(f'🧠 <b>Watch the flashing grid closely!</b>')
+        text.append('🧠 <b>Watch the flashing grid closely!</b>')
         text.append(f'Current Shape: <b>{emoji} {shape_name}</b>')
     elif phase == 'transition':
         text.append('🚶 <b>Switch to your DM!</b> The grid will appear shortly.')
     elif phase in ('ready', 'input'):
         text.append('🎯 <b>Perform the sequence in your DM now!</b>')
     elif phase == 'resolved':
-        text.append('📊 <b>Results Updated!</b> Next round starting soon...')
-    if timer_text:
-        text.extend(['', '', timer_text])
-    return '\n'.join(text)
+        text.append('📊 <b>Results updated!</b> Next round starting soon…')
+    return '\n\n'.join(text)
 
 
 async def _refresh_group(context, mid: str, event: str | None=None, finished: bool=False, seconds_left: int=None) -> None:

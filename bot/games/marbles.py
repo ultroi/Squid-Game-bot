@@ -1,8 +1,8 @@
 """Game 3 — Marbles (odd or even)."""
 import asyncio
-import random
 import html
-import logging as _lg
+import logging
+import random
 from .. import config, runtime, ui
 from ..manager import safe_edit, safe_answer, game_finished
 from ..repository import get_match, save_match, alive, get_player, pname
@@ -21,12 +21,31 @@ def _find_pair(match, uid):
     return None
 
 
+def _new_pair(player_a, player_b):
+    """Create the complete initial state for one marbles pairing."""
+    return {
+        "a": player_a,
+        "b": player_b,
+        "hider": random.choice((player_a, player_b)),
+        "marbles": {
+            str(player_a): config.MARBLES_START,
+            str(player_b): config.MARBLES_START,
+        },
+        "phase": "hide",
+        "hidden": None,
+        "bet": None,
+        "winner": None,
+    }
+
+
 def _group_details(match, seconds_left=None):
     game = match.get("game") or {}
     pairs = game.get("pairs") or []
     lines = []
-    if seconds_left is not None and seconds_left > 0:
-        lines.append(f"⏳ <b>Round starts in {seconds_left}s…</b>")
+    if seconds_left is not None:
+        lines.append(ui.round_waiting_panel(
+            "marbles", seconds_left, total_seconds=PREPARATION_SECONDS,
+        ))
         lines.append("")
     lines.append("🎱 <b>PAIR STATUS</b>")
     if not pairs:
@@ -81,11 +100,7 @@ async def begin(context, mid):
     pairs, bye = [], None
     while len(ids) >= 2:
         a, b = ids.pop(), ids.pop()
-        pairs.append({
-            "a": a, "b": b, "hider": random.choice([a, b]),
-            "marbles": {str(a): config.MARBLES_START, str(b): config.MARBLES_START},
-            "phase": "hide", "hidden": None, "bet": None, "winner": None,
-        })
+        pairs.append(_new_pair(a, b))
     if ids:
         bye = ids.pop()
     match["game"] = {"pairs": pairs, "bye": bye, "last_event": None, "round_finished": False}
@@ -121,7 +136,7 @@ async def _run_round(context, mid):
     except asyncio.CancelledError:
         raise
     except Exception:
-        _lg.getLogger(__name__).exception("Marbles run_round crashed")
+        logging.getLogger(__name__).exception("Marbles run_round crashed")
 
 
 async def _prompt_hide(context, mid, pair):
@@ -264,98 +279,110 @@ async def on_bet(update, context):
     await _refresh_group(context, mid)
 
 
+def _guess_result_text(match, pair, guesser, hider, choice, hidden, bet, guesser_wins):
+    parity = "odd" if hidden % 2 else "even"
+    result_label = "✅ Guesser wins" if guesser_wins else "❌ Guesser loses"
+    return (
+        f"🎱 Hidden: <b>{hidden}</b> ({parity}) — guess: <b>{choice.upper()}</b>\n"
+        f"{result_label} {bet} marbles!\n"
+        f"{html.escape(pname(match, guesser))}: {pair['marbles'][str(guesser)]} 🎱  |  "
+        f"{html.escape(pname(match, hider))}: {pair['marbles'][str(hider)]} 🎱"
+    )
+
+
+def _apply_guess(match, pair, guesser, choice):
+    """Apply a parity guess and advance the pair's state machine."""
+    hider = pair["hider"]
+    hidden, bet = pair["hidden"], pair["bet"]
+    guesser_key, hider_key = str(guesser), str(hider)
+    parity = "odd" if hidden % 2 else "even"
+    guesser_wins = choice == parity
+
+    if guesser_wins:
+        pair["marbles"][guesser_key] += bet
+        pair["marbles"][hider_key] -= bet
+    else:
+        pair["marbles"][guesser_key] -= bet
+        pair["marbles"][hider_key] += bet
+
+    result_text = _guess_result_text(
+        match, pair, guesser, hider, choice, hidden, bet, guesser_wins
+    )
+    if pair["marbles"][guesser_key] == 0 or pair["marbles"][hider_key] == 0:
+        pair["winner"] = guesser if pair["marbles"][guesser_key] > 0 else hider
+        pair["phase"] = "done"
+        loser = hider if pair["winner"] == guesser else guesser
+        loser_player = get_player(match, loser)
+        if loser_player:
+            loser_player["alive"] = False
+        match["game"]["last_event"] = (
+            f"{pname(match, pair['winner'])} won their marbles match and advanced."
+        )
+        return result_text, hider, True, None
+
+    pair["hider"] = _other(pair, hider)
+    pair["phase"] = "hide"
+    pair["hidden"] = None
+    pair["bet"] = None
+    match["game"]["last_event"] = (
+        "A marble exchange was resolved; active pairings remain in progress."
+    )
+    return result_text, hider, False, dict(pair)
+
+
 async def on_guess(update, context):
-    q = update.callback_query
-    _, _, mid, choice = q.data.split(":")
-    uid = q.from_user.id
+    query = update.callback_query
+    _, _, mid, choice = query.data.split(":")
+    guesser = query.from_user.id
     rt = runtime.get(mid)
 
     error_msg = None
     alert = False
     result_text = None
-    guesser = uid
     hider = None
     guesser_dm = None
     hider_dm = None
-    trigger_check_end = False
-    trigger_prompt_hide = False
+    pair_finished = False
     next_pair_state = None
 
     async with rt["lock"]:
         match = await get_match(mid)
-        if not match or match["stage"] != "marbles":
+        if not match or match.get("stage") != "marbles":
             error_msg = ""
         else:
-            pair = _find_pair(match, uid)
-            if not pair or pair["phase"] != "guess" or pair["hider"] == uid:
+            pair = _find_pair(match, guesser)
+            if not pair or pair["phase"] != "guess" or pair["hider"] == guesser:
                 error_msg, alert = "Not your move!", True
             else:
-                hider = pair["hider"]
-                hidden, bet = pair["hidden"], pair["bet"]
-                parity = "odd" if hidden % 2 else "even"
-                guesser_wins = choice == parity
-                if guesser_wins:
-                    pair["marbles"][str(guesser)] += bet
-                    pair["marbles"][str(hider)] -= bet
-                else:
-                    pair["marbles"][str(guesser)] -= bet
-                    pair["marbles"][str(hider)] += bet
-
-                result_text = (
-                    f"🎱 Hidden: <b>{hidden}</b> ({parity}) — guess: <b>{choice.upper()}</b>\n"
-                    f"{'✅ Guesser wins' if guesser_wins else '❌ Guesser loses'} {bet} marbles!\n"
-                    f"{html.escape(pname(match, guesser))}: {pair['marbles'][str(guesser)]} 🎱  |  "
-                    f"{html.escape(pname(match, hider))}: {pair['marbles'][str(hider)]} 🎱"
+                result_text, hider, pair_finished, next_pair_state = _apply_guess(
+                    match, pair, guesser, choice
                 )
-                guesser_dm = get_player(match, guesser).get("dm_mid")
-                hider_dm = get_player(match, hider).get("dm_mid")
-
-                if pair["marbles"][str(guesser)] == 0 or pair["marbles"][str(hider)] == 0:
-                    pair["winner"] = guesser if pair["marbles"][str(guesser)] > 0 else hider
-                    pair["phase"] = "done"
-                    loser = hider if pair["winner"] == guesser else guesser
-                    get_player(match, loser)["alive"] = False
-                    match["game"]["last_event"] = f"{pname(match, pair['winner'])} won their marbles match and advanced."
-                    await save_match(match)
-                    trigger_check_end = True
-                else:
-                    pair["hider"] = _other(pair, hider)
-                    pair["phase"] = "hide"
-                    pair["hidden"] = None
-                    pair["bet"] = None
-                    match["game"]["last_event"] = "A marble exchange was resolved; active pairings remain in progress."
-                    await save_match(match)
-                    next_pair_state = dict(pair)
-                    trigger_prompt_hide = True
+                guesser_player = get_player(match, guesser)
+                hider_player = get_player(match, hider)
+                guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+                hider_dm = hider_player.get("dm_mid") if hider_player else None
+                await save_match(match)
 
     if error_msg is not None:
-        await safe_answer(q, error_msg, alert)
+        await safe_answer(query, error_msg, alert)
         return
 
-    await safe_answer(q)
-    
-    # If the pair is done, clear the keyboards. Otherwise, keep them clear until _prompt_hide
-    is_done = False
-    async with rt["lock"]:
-        match_check = await get_match(mid)
-        if match_check:
-            pair_check = _find_pair(match_check, uid)
-            if pair_check and pair_check.get("phase") == "done":
-                is_done = True
-
-    markup = ui.kb([]) if is_done else None
-
+    await safe_answer(query)
+    markup = ui.kb([]) if pair_finished else None
     if guesser_dm:
-        await safe_edit(context.bot, guesser, guesser_dm, result_text, reply_markup=markup)
+        await safe_edit(
+            context.bot, guesser, guesser_dm, result_text, reply_markup=markup
+        )
     if hider_dm:
-        await safe_edit(context.bot, hider, hider_dm, result_text, reply_markup=markup)
+        await safe_edit(
+            context.bot, hider, hider_dm, result_text, reply_markup=markup
+        )
 
     await _refresh_group(context, mid)
-
-    if trigger_check_end:
+    if pair_finished:
         await _check_end(context, mid)
-    elif trigger_prompt_hide:
-        # Thoda pause taaki players result padh sakein naye prompt aane se pehle
+    elif next_pair_state:
+        # Give both players a moment to read the result before the next prompt.
         await asyncio.sleep(2.0)
         await _prompt_hide(context, mid, next_pair_state)
 

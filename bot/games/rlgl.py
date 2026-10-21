@@ -99,9 +99,11 @@ def _retry_seconds(exc):
 
 def _hydrate_grid(match):
     """Snapshot the player positions into a uid-keyed dict for the tick loop."""
-    size = max(1, int(config.GRID_SIZE))
+    players = match.get("players") or []
+    # Make size dynamic: at least config.GRID_SIZE, but expands if there are more players
+    size = max(int(config.GRID_SIZE), len(players))
     grid = {}
-    for index, player in enumerate(match.get("players") or []):
+    for index, player in enumerate(players):
         if player.get("id") is None:
             continue
         uid = str(player.get("id"))
@@ -339,7 +341,9 @@ async def _countdown_to_race(context, mid):
             context.bot,
             match,
             "rlgl",
-            details=f"⏳ <b>Private race starts in {remaining} seconds</b>",
+            details=ui.round_waiting_panel(
+                "rlgl", remaining, total_seconds=5,
+            ),
             event="The race is getting ready.",
             reply_markup=ui.kb([]),
         )
@@ -353,7 +357,9 @@ async def _countdown_to_race(context, mid):
         context.bot,
         match,
         "rlgl",
-        details="📩 <b>Opening private race controls…</b>",
+        details=ui.round_waiting_panel(
+            "rlgl", 0, total_seconds=5,
+        ),
         event="Preparing private race controls.",
         reply_markup=ui.kb([]),
     )
@@ -392,7 +398,6 @@ async def _activate_race(context, mid, match, rt, start_event, dm_markup):
         force=True,
     )
 
-
 async def begin(context, mid):
     """Set up the race, deliver private boards, and start background workers."""
     match = await get_match(mid)
@@ -403,7 +408,7 @@ async def begin(context, mid):
     if not players:
         return
 
-    grid_size = max(1, int(config.GRID_SIZE))
+    grid_size = max(int(config.GRID_SIZE), len(players))
     for index, player in enumerate(players):
         player["pos"] = [
             grid_size - 1 - (index // grid_size),
@@ -435,7 +440,9 @@ async def begin(context, mid):
         context.bot,
         match,
         "rlgl",
-        details="⏳ <b>Private race starts in 5 seconds</b>",
+        details=ui.round_waiting_panel(
+            "rlgl", 5, total_seconds=5,
+        ),
         event="The race is getting ready.",
     )
     await save_match(match)
@@ -596,7 +603,7 @@ async def _apply_moves(context, mid, moves):
             return
 
         grid = rt.get("grid") or {}
-        grid_size = max(1, int(config.GRID_SIZE))
+        grid_size = max(int(config.GRID_SIZE), len(grid))
         touched = False
         state_changed = False
         last_event = None

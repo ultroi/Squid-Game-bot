@@ -21,12 +21,12 @@ RED_IMG = "https://i.ibb.co/gp8gt2s/41768240-4fc8-4ad9-ac41-9aaba8325c8d.jpg"
 # Round artwork is embedded into the announcement's Rich Message HTML.
 # ``bridge`` is the existing stage key for the Hopscotch / Glass Bridge round.
 ROUND_ANNOUNCEMENT_IMAGES = {
-    "rlgl": "https://i.ibb.co/jvqp1055/6c583f6f-06f9-4f09-a54b-500de3ade3d9.jpg",
-    "dalgona": "https://i.ibb.co/0V6Q5xHg/917ed946-9715-49be-8b3d-ac755502af98.jpg",
-    "marbles": "https://i.ibb.co/4Zd5gkYn/1279a769-bd2d-41df-a142-6dcdb1eb4fe0.jpg",
-    "bridge": "https://i.ibb.co/DHYGK6jM/6e1fc28c-b315-409b-8293-d65459a0884f.jpg",
-    "vote": "https://i.ibb.co/gMn4YpHL/5ff81dd3-84c9-4cfb-9390-3ac406e2b6af.jpg",
-    "final": "https://i.ibb.co/nsj9FyCj/c129d016-baa2-400c-91ea-0f5102289e0b.jpg",
+    "rlgl": "https://i.ibb.co/RtTGDPF/0d120550-9d01-4732-a898-db1ca770a047.jpg",
+    "dalgona": "https://i.ibb.co/RGqCsDDt/09a98da7-f6ab-4f49-ac64-776eef00371e.jpg",
+    "marbles": "https://i.ibb.co/hRzyNb6w/b5b679a0-763d-481e-9262-0d33ef12fbb3.jpg",
+    "bridge": "https://i.ibb.co/6czCm9G0/04d482ce-0202-42b0-a1a7-d109c67c6bc6.jpg",
+    "vote": "https://i.ibb.co/kskLd5RQ/5bceef12-a1ac-439b-930f-657c3a7a216f.jpg",
+    "final": "https://i.ibb.co/C5xQQZby/31f3f3f0-aae7-4c1a-8723-de96c6e53fe0.jpg",
 }
 
 
@@ -99,6 +99,38 @@ ROUND_INFO = {
         "Choose your combat move privately. Offensive beats Defensive, Defensive beats Trickster, and Trickster beats Offensive. Last survivor wins.",
     ),
 }
+
+ROUND_WAITING_HINTS = {
+    "rlgl": "Get ready — your private movement board is opening soon.",
+    "dalgona": "Watch the group pattern, then repeat it on your private grid.",
+    "marbles": "Get ready to hide marbles, bet, and guess odd or even in your DM.",
+    "bridge": "Get ready to choose the safe left or right glass panel in your DM.",
+    "vote": "Voting controls will arrive in your private chat when voting opens.",
+    "final": "Your duel controls will arrive in your DM when the bracket opens.",
+}
+
+
+def round_waiting_panel(stage, seconds_left, *, total_seconds=30, hint=None):
+    total = max(1, int(total_seconds))
+    remaining = max(0, min(total, int(seconds_left)))
+    completed_blocks = max(0, min(10, round((total - remaining) / total * 10)))
+    progress_bar = "🟩" * completed_blocks + "⬜" * (10 - completed_blocks)
+    if remaining > 0:
+        countdown = f"⏳ <b>Starting in</b> <code>{remaining:02d}s</code>"
+    else:
+        countdown = "🚦 <b>STARTING NOW</b>"
+
+    instruction = hint or ROUND_WAITING_HINTS.get(
+        str(stage or "").lower(),
+        "Stay ready ",
+    )
+    return "\n".join((
+        "🎮 <b>ROUND PREPARATION</b>",
+        progress_bar,
+        "",
+        countdown,
+        f"<i>{html.escape(str(instruction))}</i>",
+    ))
 
 
 def _match_counts(match, stage=None):
@@ -375,33 +407,40 @@ def round_status_text(match, stage, details=None, event=None, finished=False):
         stage, (0, str(stage).replace("_", " ").upper(), "Follow the instructions below.")
     )
     alive_count, qualified, eliminated, total = _match_counts(match, stage)
+    
+    # 1. Clean Header
     heading = (
-        f"🦑 <b>SQUID GAME · ROUND {round_number}</b>"
-        if round_number else "🦑 <b>SQUID GAME</b>"
+        f"🦑 <b>ROUND {round_number} · {html.escape(title)}</b>"
+        if round_number else f"🦑 <b>{html.escape(title)}</b>"
     )
 
+    # 2. Highlighted Status Line
     if finished:
-        status_line = "🏁 <b>ROUND COMPLETE</b>"
+        status_line = "🏁 <b>STATUS:</b> <code>ROUND COMPLETE</code>"
     elif match.get("round_preparing"):
-        status_line = "⏳ <b>PREPARING · CONTROLS OPEN SOON</b>"
+        status_line = "⏳ <b>STATUS:</b> <code>PREPARING...</code>"
     else:
-        status_line = "🟢 <b>IN PROGRESS</b>"
+        status_line = "🟢 <b>STATUS:</b> <code>IN PROGRESS</code>"
 
+    # 3. Better Spaced Stats
     if stage == "rlgl":
-        stats_line = f"🏃 {alive_count} racing  ·  🏁 {qualified} finished  ·  💀 {eliminated} out"
+        stats_line = f"🏃 <b>Racing:</b> {alive_count}  |  🏁 <b>Finished:</b> {qualified}  |  💀 <b>Out:</b> {eliminated}"
     else:
-        stats_line = f"👥 {alive_count} alive  ·  💀 {eliminated} out  ·  {total} total"
+        stats_line = f"👥 <b>Alive:</b> {alive_count}  |  💀 <b>Out:</b> {eliminated}  |  📊 <b>Total:</b> {total}"
 
-    details_block = f"\n\n{details}" if details else ""
+    # 4. Structured Additional Blocks
+    details_block = f"\n\n👇 <b>Round Details:</b>\n{details}" if details else ""
+    
     event_block = (
-        f"\n\n📣 <b>Update:</b> {html.escape(str(event)[:140])}"
+        f"\n\n📣 <b>Live Update:</b>\n<i>{html.escape(str(event)[:140])}</i>"
         if event and not finished else ""
     )
+    
     results_block = _round_result_block(match, stage) if finished else ""
 
+    # Assemble everything with clear visual breaks
     return (
         f"{heading}\n"
-        f"<b>{html.escape(title)}</b>\n"
         f"<i>{html.escape(description)}</i>\n\n"
         f"{status_line}\n"
         f"{stats_line}"
@@ -426,51 +465,30 @@ def next_round_gate_text(match, seconds_left=None):
     source_title = html.escape(str(gate.get("completed_title") or "Previous round"))
     from_stage = gate.get("from_stage")
     next_copy = {
-        "rlgl": ("🍪 <b>UP NEXT · DALGONA CANDY</b>", "Watch the shared group pattern, then repeat it on the private numbered grid. One wrong tap or timeout eliminates you."),
-        "dalgona": ("🎱 <b>UP NEXT · MARBLES</b>", "Play your paired opponent privately. Hide marbles, bet carefully and win to survive."),
-        "marbles": ("🌉 <b>UP NEXT · GLASS BRIDGE</b>", "Choose left or right privately. A wrong glass tile eliminates you."),
-        "bridge": ("🗳 <b>UP NEXT · VOTE OR FINAL</b>", "The next round depends on how many qualified players enter."),
-        "vote": ("⚔️ <b>UP NEXT · SQUID GAME FINAL</b>", "Choose tactical combat moves. One champion remains."),
-        "final": ("⚔️ <b>UP NEXT · FINAL BRACKET</b>", "Enter to continue into the next set of tactical duels."),
+        "rlgl": ("🍪 <b>NEXT · DALGONA CANDY</b>", "Watch the shared group pattern, then repeat it on the private numbered grid. One wrong tap or timeout eliminates you."),
+        "dalgona": ("🎱 <b>NEXT · MARBLES</b>", "Play your paired opponent privately. Hide marbles, bet carefully and win to survive."),
+        "marbles": ("🌉 <b>NEXT · GLASS BRIDGE</b>", "Choose left or right privately. A wrong glass tile eliminates you."),
+        "bridge": ("🗳 <b> NEXT · VOTE OR FINAL</b>", "The next round depends on how many qualified players enter."),
+        "vote": ("⚔️ <b>NEXT · SQUID GAME FINAL</b>", "Choose tactical combat moves. One champion remains."),
+        "final": ("⚔️ <b>NEXT · FINAL BRACKET</b>", "Enter to continue into the next set of tactical duels."),
     }
     next_heading, next_description = next_copy.get(
         from_stage, ("🎮 <b>UP NEXT</b>", "Enter to continue the competition.")
     )
+    
     if gate.get("status") != "open":
         action_line = "⏳ <b>Entry closed</b>"
     else:
         action_line = f"⏳ <b>{seconds_left}s left to enter</b>"
 
-    results = (match.get("round_results") or {}).get(from_stage) or {}
-    player_by_id = {str(p.get("id", p.get("user_id"))): p for p in (match.get("players") or [])}
-    qualified_ids = results.get("qualified_ids", eligible)
-    eliminated_ids = results.get("eliminated_ids", [])
-    qualified_names = [
-        html.escape(str((player_by_id.get(str(uid)) or {}).get("name") or uid)[:32])
-        for uid in qualified_ids
-    ]
-    eliminated_names = [
-        html.escape(str((player_by_id.get(str(uid)) or {}).get("name") or uid)[:32])
-        for uid in eliminated_ids
-    ]
-    qualified_line = ", ".join(qualified_names) if qualified_names else "None"
-    eliminated_line = ", ".join(eliminated_names) if eliminated_names else "None"
-
     # --- EASY TO EDIT UI FORMAT ---
     return (
-        f"🦑 <b>ROUND RESULTS</b>\n"
-        f"🏁 <b>{source_title}</b> complete\n"
-        f"✅ Qualified: <b>{len(qualified_ids)}</b>\n"
-        f"<i>{qualified_line}</i>\n"
-        f"💀 Eliminated: <b>{len(eliminated_ids)}</b>\n"
-        f"<i>{eliminated_line}</i>\n"
-        f"\n"
+        f"🏁 <b>{source_title}</b> complete!\n\n"
         f"{next_heading}\n"
-        f"<i>{next_description}</i>\n"
-        f"\n"
+        f"<i>{next_description}</i>\n\n"
         f"🎟 <b>Entry:</b> {len(joined)}/{len(eligible)} qualified players\n"
-        f"Tap <b>ENTER NEXT ROUND</b> below to continue.\n"
-        f"{action_line} · Anyone who does not enter is eliminated from the match."
+        f"{action_line}\n"
+        f"<i>Tap below to continue. Missing the timer means elimination.</i>"
     )
 
 def round_preparation_text(stage, entrants_count, seconds_left):
@@ -513,7 +531,6 @@ def _round_announcement_html(stage, text):
         if not line:
             continue
 
-        # Preserve inline HTML formatting and create a real block.
         paragraphs.append(f"<p>{line}</p>")
 
     return image_block + "".join(paragraphs)

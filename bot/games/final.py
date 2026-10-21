@@ -16,6 +16,29 @@ BEATS = {"offense": "defense", "defense": "trickster", "trickster": "offense"}
 LABEL = {"offense": "⚔️ Offensive", "defense": "🛡️ Defensive", "trickster": "🃏 Trickster"}
 
 
+def _timeout_winner(duel):
+    """Choose the advancing player when a duel misses its deadline."""
+    player_a, player_b = str(duel["a"]), str(duel["b"])
+    picks = duel.get("picks", {})
+    if player_a in picks and player_b not in picks:
+        return player_a, player_b
+    if player_b in picks and player_a not in picks:
+        return player_b, player_a
+    return random.choice([(player_a, player_b), (player_b, player_a)])
+
+
+def _duel_status_line(match, duel):
+    """Render one duel's current state for the public bracket card."""
+    player_a = html.escape(pname(match, duel["a"]))
+    player_b = html.escape(pname(match, duel["b"]))
+    if duel.get("winner") is not None:
+        status = f"🏅 {html.escape(pname(match, duel['winner']))} advances"
+    else:
+        locked = len(duel.get("picks") or {})
+        status = f"🎮 In progress · picks locked: {locked}/2"
+    return f"• {player_a} vs {player_b} — {status}"
+
+
 async def _bracket_timeout(context, mid, bracket_round_idx):
     """Wait for a maximum bracket duration, then forcibly resolve incomplete duels."""
     try:
@@ -41,17 +64,7 @@ async def _bracket_timeout(context, mid, bracket_round_idx):
         for duel in game.get("duels", []):
             if duel["winner"] is None:
                 incomplete_duels = True
-                a, b = str(duel["a"]), str(duel["b"])
-                
-                # Determine who failed to pick and penalize them
-                picks = duel.get("picks", {})
-                if a in picks and b not in picks:
-                    winner_uid, loser_uid = a, b
-                elif b in picks and a not in picks:
-                    winner_uid, loser_uid = b, a
-                else:
-                    # Neither picked (or both stuck), choose randomly to unblock the game
-                    winner_uid, loser_uid = random.choice([(a, b), (b, a)])
+                winner_uid, loser_uid = _timeout_winner(duel)
 
                 duel["winner"] = int(winner_uid)
                 game["winners"].append(int(winner_uid))
@@ -82,6 +95,8 @@ async def _bracket_timeout(context, mid, bracket_round_idx):
         await _refresh_group(context, mid)
         await _advance_bracket(context, mid)
 
+        
+
 def _final_details(match, seconds_left=None):
     game = match.get("game") or {}
     duels = game.get("duels") or []
@@ -92,23 +107,17 @@ def _final_details(match, seconds_left=None):
     else:
         live_contenders = len(contenders)
     lines = []
-    if seconds_left is not None and seconds_left > 0:
-        lines.append(f"⏳ <b>First duel opens in {seconds_left}s…</b>")
+    if seconds_left is not None:
+        lines.append(ui.round_waiting_panel(
+            "final", seconds_left, total_seconds=PREPARATION_SECONDS,
+        ))
         lines.append("")
     lines.extend([
         f"⚔️ <b>Bracket round:</b> {bracket_round}",
         f"👥 <b>Players in bracket:</b> {live_contenders}  ·  "
         f"✅ <b>Duels decided:</b> {sum(1 for duel in duels if duel.get('winner') is not None)}/{len(duels)}",
     ])
-    for duel in duels[:10]:
-        a = html.escape(pname(match, duel["a"]))
-        b = html.escape(pname(match, duel["b"]))
-        if duel.get("winner") is not None:
-            state = f"🏅 {html.escape(pname(match, duel['winner']))} advances"
-        else:
-            locked = len(duel.get("picks") or {})
-            state = f"🎮 In progress · picks locked: {locked}/2"
-        lines.append(f"• {a} vs {b} — {state}")
+    lines.extend(_duel_status_line(match, duel) for duel in duels[:10])
     if len(duels) > 10:
         lines.append(f"…and {len(duels) - 10} more duels")
     for uid in game.get("byes") or []:
@@ -122,7 +131,6 @@ def _final_details(match, seconds_left=None):
         f"❤️ {config.FINAL_HP} HP each · {config.FINAL_DAMAGE} damage per lost exchange",
     ])
     return "\n".join(lines)
-
 
 async def _refresh_group(context, mid, event=None, finished=False):
     rt = runtime.get(mid)
@@ -232,6 +240,18 @@ async def _start_bracket_round(context, mid):
     for index in range(len(match["game"]["duels"])):
         await _prompt_duel(context, mid, index, intro=True)
 
+def _duel_prompt_text(match, duel, uid):
+    """Build the private duel prompt for one participant."""
+    opponent = duel["b"] if uid == duel["a"] else duel["a"]
+    own_hp = duel["hp"][str(uid)]
+    opponent_hp = duel["hp"][str(opponent)]
+    return (
+        f"🦑 <b>DUEL</b> vs {html.escape(pname(match, opponent))}\n\n"
+        f"You  {ui.hp_bar(own_hp)} {own_hp} HP\n"
+        f"Foe  {ui.hp_bar(opponent_hp)} {opponent_hp} HP\n\n"
+        "Choose your move. Your choice stays hidden until both players select."
+    )
+
 async def _prompt_duel(context, mid, idx, intro=False):
     rt = runtime.get(mid)
     async with rt["lock"]:
@@ -241,15 +261,12 @@ async def _prompt_duel(context, mid, idx, intro=False):
         duel = match["game"]["duels"][idx]
         updates_needed = []
         for uid in (duel["a"], duel["b"]):
-            foe = duel["b"] if uid == duel["a"] else duel["a"]
-            text = (
-                f"🦑 <b>DUEL</b> vs {html.escape(pname(match, foe))}\n\n"
-                f"You  {ui.hp_bar(duel['hp'][str(uid)])} {duel['hp'][str(uid)]} HP\n"
-                f"Foe  {ui.hp_bar(duel['hp'][str(foe)])} {duel['hp'][str(foe)]} HP\n\n"
-                "Choose your move. Your choice stays hidden until both players select."
-            )
             player = get_player(match, uid)
-            updates_needed.append({"uid": uid, "text": text, "dm_mid": player.get("dm_mid")})
+            updates_needed.append({
+                "uid": uid,
+                "text": _duel_prompt_text(match, duel, uid),
+                "dm_mid": player.get("dm_mid") if player else None,
+            })
 
     for info in updates_needed:
         try:
@@ -310,75 +327,90 @@ async def on_pick(update, context):
         await _resolve_exchange(context, mid, idx)
 
 
+def _apply_exchange(match, duel):
+    """Apply both locked choices and return the exchange outcome."""
+    game = match["game"]
+    player_a, player_b = duel["a"], duel["b"]
+    key_a, key_b = str(player_a), str(player_b)
+    pick_a, pick_b = duel["picks"][key_a], duel["picks"][key_b]
+
+    if pick_a == pick_b:
+        event = f"Both duelists chose {LABEL[pick_a]}; no damage dealt."
+    elif BEATS[pick_a] == pick_b:
+        duel["hp"][key_b] -= config.FINAL_DAMAGE
+        event = (
+            f"{pname(match, player_a)}'s {LABEL[pick_a]} beats {LABEL[pick_b]}; "
+            f"{pname(match, player_b)} takes {config.FINAL_DAMAGE} damage."
+        )
+    else:
+        duel["hp"][key_a] -= config.FINAL_DAMAGE
+        event = (
+            f"{pname(match, player_b)}'s {LABEL[pick_b]} beats {LABEL[pick_a]}; "
+            f"{pname(match, player_a)} takes {config.FINAL_DAMAGE} damage."
+        )
+    duel["picks"] = {}
+
+    hp_a, hp_b = duel["hp"][key_a], duel["hp"][key_b]
+    if hp_a <= 0 or hp_b <= 0:
+        loser = player_a if hp_a <= 0 else player_b
+        winner = player_b if hp_a <= 0 else player_a
+        duel["winner"] = winner
+        loser_player = get_player(match, loser)
+        winner_player = get_player(match, winner)
+        if loser_player:
+            loser_player["alive"] = False
+        if winner not in game["winners"]:
+            game["winners"].append(winner)
+        game["last_event"] = (
+            f"{event} {pname(match, winner)} wins the duel; "
+            f"{pname(match, loser)} is eliminated."
+        )
+        return {
+            "event": game["last_event"],
+            "loser": loser,
+            "winner": winner,
+            "loser_dm": loser_player.get("dm_mid") if loser_player else None,
+            "winner_dm": winner_player.get("dm_mid") if winner_player else None,
+            "advance_now": all(item["winner"] is not None for item in game["duels"]),
+        }
+
+    game["last_event"] = event
+    return {"event": event, "loser": None, "winner": None, "advance_now": False}
+
+
 async def _resolve_exchange(context, mid, idx):
     rt = runtime.get(mid)
-    loser = None
-    winner = None
-    loser_dm = None
-    winner_dm = None
-    advance_now = False
-
     async with rt["lock"]:
         match = await get_match(mid)
         if not match or match.get("stage") != "final":
             return
+
         game = match["game"]
         duel = game["duels"][idx]
-
         if len(duel["picks"]) != 2:
             return
 
-        a, b = str(duel["a"]), str(duel["b"])
-        pick_a, pick_b = duel["picks"][a], duel["picks"][b]
+        outcome = _apply_exchange(match, duel)
+        await save_match(match)
 
-        if pick_a == pick_b:
-            event = f"Both duelists chose {LABEL[pick_a]}; no damage dealt."
-        elif BEATS[pick_a] == pick_b:
-            duel["hp"][b] -= config.FINAL_DAMAGE
-            event = f"{pname(match, duel['a'])}'s {LABEL[pick_a]} beats {LABEL[pick_b]}; {pname(match, duel['b'])} takes {config.FINAL_DAMAGE} damage."
-        else:
-            duel["hp"][a] -= config.FINAL_DAMAGE
-            event = f"{pname(match, duel['b'])}'s {LABEL[pick_b]} beats {LABEL[pick_a]}; {pname(match, duel['a'])} takes {config.FINAL_DAMAGE} damage."
-        duel["picks"] = {}
-
-        if duel["hp"][a] <= 0 or duel["hp"][b] <= 0:
-            loser = duel["a"] if duel["hp"][a] <= 0 else duel["b"]
-            winner = duel["b"] if duel["hp"][a] <= 0 else duel["a"]
-            duel["winner"] = winner
-
-            loser_player = get_player(match, loser)
-            if loser_player:
-                loser_player["alive"] = False
-                loser_dm = loser_player.get("dm_mid")
-
-            if winner not in game["winners"]:
-                game["winners"].append(winner)
-
-            winner_player = get_player(match, winner)
-            if winner_player:
-                winner_dm = winner_player.get("dm_mid")
-
-            game["last_event"] = f"{event} {pname(match, winner)} wins the duel; {pname(match, loser)} is eliminated."
-            await save_match(match)
-
-            if all(item["winner"] is not None for item in game["duels"]):
-                advance_now = True
-        else:
-            game["last_event"] = event
-            await save_match(match)
-
-    if loser is not None and winner is not None:
-        if loser_dm:
-            await safe_edit(context.bot, loser, loser_dm, "💀 You lost the duel. <b>ELIMINATED.</b>", reply_markup=ui.kb([]))
-        if winner_dm:
-            await safe_edit(context.bot, winner, winner_dm, "🎉 You won the duel! Advancing to the next bracket.", reply_markup=ui.kb([]))
-
+    if outcome["winner"] is not None:
+        if outcome.get("loser_dm"):
+            await safe_edit(
+                context.bot, outcome["loser"], outcome["loser_dm"],
+                "💀 You lost the duel. <b>ELIMINATED.</b>", reply_markup=ui.kb([]),
+            )
+        if outcome.get("winner_dm"):
+            await safe_edit(
+                context.bot, outcome["winner"], outcome["winner_dm"],
+                "🎉 You won the duel! Advancing to the next bracket.", reply_markup=ui.kb([]),
+            )
         await _refresh_group(context, mid)
-        if advance_now:
+        if outcome["advance_now"]:
             await _advance_bracket(context, mid)
-    else:
-        await _refresh_group(context, mid)
-        await _prompt_duel(context, mid, idx, intro=False)
+        return
+
+    await _refresh_group(context, mid)
+    await _prompt_duel(context, mid, idx, intro=False)
 
 
 async def _advance_bracket(context, mid):

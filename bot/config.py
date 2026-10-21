@@ -21,7 +21,7 @@ ROUND_ENTRY_SECONDS = max(5, int(os.getenv("ROUND_ENTRY_SECONDS", "30")))
 ROUND_PREPARATION_SECONDS = max(1, int(os.getenv("ROUND_PREPARATION_SECONDS", "5")))
 
 # ---- game 1: red light green light ----
-RLGL_SECONDS = 90
+RLGL_SECONDS = 60
 GRID_SIZE = 10
 
 # ---- game 2: dalgona ----

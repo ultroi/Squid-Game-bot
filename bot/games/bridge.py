@@ -33,12 +33,7 @@ async def begin(context, mid):
         context.bot,
         match,
         "bridge",
-        details=(
-            f"⏳ <b>Round starts in {PREPARATION_SECONDS}s…</b>\n\n"
-            f"🌉 <b>Bridge progress</b>\n{_bridge_details(match)}\n"
-            f"⏱ Total time: <b>{config.BRIDGE_SECONDS}s</b>\n"
-            "<i>Turn prompts and left/right choices arrive privately.</i>"
-        ),
+        details=_preparation_details(match, PREPARATION_SECONDS),
     )
     match["board_message_id"] = board.message_id
     await save_match(match)
@@ -55,12 +50,10 @@ async def _run_round(context, mid):
             if not latest or latest.get("stage") != "bridge":
                 return
             await ui.refresh_round_announcement(
-                context.bot, latest, "bridge",
-                details=(
-                    f"⏳ <b>Round starts in {shown}s…</b>\n\n"
-                    f"🌉 <b>Bridge progress</b>\n{_bridge_details(latest)}\n"
-                    f"⏱ Total time: <b>{config.BRIDGE_SECONDS}s</b>"
-                ),
+                context.bot,
+                latest,
+                "bridge",
+                details=_preparation_details(latest, shown),
             )
         await asyncio.sleep(5)
 
@@ -77,6 +70,17 @@ async def _run_round(context, mid):
     except Exception:
         log.exception("Bridge run_round crashed")
 
+
+def _preparation_details(match, seconds_left):
+    """Combine the shared preparation panel with bridge-specific progress."""
+    return "\n".join((
+        ui.round_waiting_panel(
+            "bridge", seconds_left, total_seconds=PREPARATION_SECONDS,
+        ),
+        "",
+        f"🌉 <b>Bridge progress</b>\n{_bridge_details(match)}",
+        f"⏱ <b>Play time:</b> {config.BRIDGE_SECONDS}s",
+    ))
 
 def _bridge_details(match):
     g = match.get("game") or {}
@@ -162,81 +166,106 @@ async def _prompt(context, mid):
         await _next(context, mid)
 
 
-async def on_pick(update, context):
-    q = update.callback_query
-    _, mid, side = q.data.split(":")
-    side = int(side)
-    uid = q.from_user.id
-    rt = runtime.get(mid)
+def _apply_pick(match, uid, side):
+    """Validate and apply one bridge choice while the match lock is held."""
+    result = {
+        "error_msg": None,
+        "alert": False,
+        "result_kind": None,
+        "row": -1,
+        "dm_mid": None,
+    }
+    if not match or match.get("stage") != "bridge":
+        result["error_msg"] = ""
+        return result
 
-    error_msg = None
-    alert = False
-    result_kind = None
-    row = -1
-    dm_mid = None
+    game = match["game"]
+    queue = game["queue"]
+    if game["idx"] >= len(queue) or queue[game["idx"]] != uid:
+        result.update(error_msg="Not your turn!", alert=True)
+        return result
 
-    async with rt["lock"]:
-        match = await get_match(mid)
-        if not match or match["stage"] != "bridge":
-            error_msg = ""
+    player = get_player(match, uid)
+    if not player or not player.get("alive"):
+        result.update(error_msg="You're eliminated.", alert=True)
+        return result
+
+    row = game["progress"] + 1
+    result["row"] = row
+    result["dm_mid"] = player.get("dm_mid")
+
+    if game["tiles"][row] == side:
+        game["progress"] = row
+        if row == config.BRIDGE_LENGTH - 1:
+            game["crossed"].append(uid)
+            game["last_event"] = f"{pname(match, uid)} crossed the bridge safely."
+            result["result_kind"] = "win"
         else:
-            g = match["game"]
-            if g["idx"] >= len(g["queue"]) or g["queue"][g["idx"]] != uid:
-                error_msg, alert = "Not your turn!", True
-            else:
-                p = get_player(match, uid)
-                if not p or not p.get("alive"):
-                    error_msg, alert = "You're eliminated.", True
-                else:
-                    dm_mid = p.get("dm_mid")
-                    row = g["progress"] + 1
-                    if g["tiles"][row] == side:
-                        g["progress"] = row
-                        if row == config.BRIDGE_LENGTH - 1:
-                            g["crossed"].append(uid)
-                            g["last_event"] = f"{pname(match, uid)} crossed the bridge safely."
-                            result_kind = "win"
-                        else:
-                            g["last_event"] = f"{pname(match, uid)} advanced to step {row + 1}."
-                            result_kind = "safe"
-                    else:
-                        g["broken"].append([row, side])
-                        p["alive"] = False
-                        g["last_event"] = f"{pname(match, uid)} fell at step {row + 1} and was eliminated."
-                        result_kind = "dead"
-                    await save_match(match)
+            game["last_event"] = f"{pname(match, uid)} advanced to step {row + 1}."
+            result["result_kind"] = "safe"
+    else:
+        game["broken"].append([row, side])
+        player["alive"] = False
+        game["last_event"] = (
+            f"{pname(match, uid)} fell at step {row + 1} and was eliminated."
+        )
+        result["result_kind"] = "dead"
+    return result
 
-    if error_msg is not None:
-        await safe_answer(q, error_msg, alert)
+
+async def _send_pick_feedback(context, query, uid, mid, result):
+    """Answer the callback and update the player's private bridge controls."""
+    kind = result["result_kind"]
+    row = result["row"]
+    message_id = result["dm_mid"]
+
+    if kind == "win":
+        await safe_answer(query, "✅ Safe!")
+        text = "🎉 <b>You crossed the bridge!</b>"
+        markup = ui.kb([])
+    elif kind == "safe":
+        await safe_answer(query, "✅ Safe!")
+        text = (
+            f"✅ Safe! Step <b>{row + 1}/{config.BRIDGE_LENGTH}</b> — keep going:"
+        )
+        markup = ui.bridge_keyboard(mid)
+    elif kind == "dead":
+        await safe_answer(query, "💥 Wrong glass!", True)
+        text = "💥💀 <b>The glass shattered. You fell. ELIMINATED.</b>"
+        markup = ui.kb([])
+    else:
         return
 
-    if result_kind == "win":
-        await safe_answer(q, "✅ Safe!")
-        if dm_mid:
-            await safe_edit(
-                context.bot, uid, dm_mid, 
-                "🎉 <b>You crossed the bridge!</b>", 
-                reply_markup=ui.kb([])
-            )
-    elif result_kind == "safe":
-        await safe_answer(q, "✅ Safe!")
-        if dm_mid:
-            await safe_edit(
-                context.bot, uid, dm_mid,
-                f"✅ Safe! Step <b>{row + 1}/{config.BRIDGE_LENGTH}</b> — keep going:",
-                reply_markup=ui.bridge_keyboard(mid),
-            )
-    elif result_kind == "dead":
-        await safe_answer(q, "💥 Wrong glass!", True)
-        if dm_mid:
-            await safe_edit(
-                context.bot, uid, dm_mid, 
-                "💥💀 <b>The glass shattered. You fell. ELIMINATED.</b>", 
-                reply_markup=ui.kb([])
-            )
+    if message_id:
+        await safe_edit(
+            context.bot,
+            uid,
+            message_id,
+            text,
+            reply_markup=markup,
+        )
 
+
+async def on_pick(update, context):
+    query = update.callback_query
+    _, mid, raw_side = query.data.split(":")
+    side = int(raw_side)
+    uid = query.from_user.id
+    runtime_state = runtime.get(mid)
+
+    async with runtime_state["lock"]:
+        match = await get_match(mid)
+        result = _apply_pick(match, uid, side)
+        if result["error_msg"] is None and result["result_kind"] is not None:
+            await save_match(match)
+
+    if result["error_msg"] is not None:
+        await safe_answer(query, result["error_msg"], result["alert"])
+        return
+
+    await _send_pick_feedback(context, query, uid, mid, result)
     await _refresh(context, mid)
-    if result_kind in ("win", "dead"):
+    if result["result_kind"] in ("win", "dead"):
         await _next(context, mid)
 
 

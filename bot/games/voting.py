@@ -19,8 +19,10 @@ def _details(match, seconds_left=None):
     votes = game.get("votes") or {}
     eligible = int(game.get("eligible_count", sum(1 for player in match.get("players", []) if player.get("alive"))))
     lines = []
-    if seconds_left is not None and seconds_left > 0:
-        lines.append(f"⏳ <b>Voting opens in {seconds_left}s…</b>")
+    if seconds_left is not None:
+        lines.append(ui.round_waiting_panel(
+            "vote", seconds_left, total_seconds=PREPARATION_SECONDS,
+        ))
         lines.append("")
     lines.append(f"🗳 <b>Votes submitted:</b> {len(votes)}/{eligible}")
     lines.append("<i>Ballots are private. The player with the most votes is eliminated; ties are random.</i>")
@@ -161,6 +163,21 @@ async def _timeout(context, mid):
     await _resolve(context, mid)
 
 
+def _select_victim(players, votes):
+    """Select the most-voted player, breaking ties randomly."""
+    tally = Counter(votes.values())
+    if not tally:
+        return random.choice([player["id"] for player in players])
+
+    highest_vote_count = max(tally.values())
+    tied_players = [
+        user_id
+        for user_id, count in tally.items()
+        if count == highest_vote_count
+    ]
+    return random.choice(tied_players)
+
+
 async def _resolve(context, mid):
     rt = runtime.get(mid)
     survivors = []
@@ -181,12 +198,7 @@ async def _resolve(context, mid):
             is_empty = True
         else:
             game["resolved"] = True
-            tally = Counter(game["votes"].values())
-            if tally:
-                top = max(tally.values())
-                victim = random.choice([user_id for user_id, count in tally.items() if count == top])
-            else:
-                victim = random.choice([player["id"] for player in players])
+            victim = _select_victim(players, game["votes"])
 
             victim_player = get_player(match, victim)
             if victim_player:

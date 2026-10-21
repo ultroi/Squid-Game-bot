@@ -4,13 +4,13 @@ import os
 import time
 from datetime import datetime, timezone
 import html
-from telegram import Update
+
+from telegram import ChatMember, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram import ChatMember, ChatMemberUpdated
+
 from .. import config, runtime, ui
-from ..database import matches
+from ..database import matches, groups
 from ..manager import advance, safe_edit, safe_answer, refresh_lobby_scoreboard
 from ..repository import (
     upsert_user,
@@ -66,7 +66,6 @@ async def track_group_memberships(update: Update, context: ContextTypes.DEFAULT_
         return
 
     try:
-        from ..database import groups
         if not was_member and is_member:
             # Bot was added to a group
             await groups.update_one(
@@ -126,7 +125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     video=file_id,
                     caption=config.WELCOME_CAPTION,
                     parse_mode="HTML",
-                    reply_markup=keyboard,  # <-- Added keyboard
+                    reply_markup=keyboard,
                 )
                 return
             except TelegramError:
@@ -136,7 +135,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
-        video_path = config.WELCOME_VIDEO
+        video_path = getattr(config, "WELCOME_VIDEO", "assets/welcome.mp4")
         if os.path.isfile(video_path):
             try:
                 with open(video_path, "rb") as video:
@@ -144,7 +143,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         video=video,
                         caption=config.WELCOME_CAPTION,
                         parse_mode="HTML",
-                        reply_markup=keyboard,  # <-- Added keyboard
+                        reply_markup=keyboard,
                     )
                 if sent.video:
                     try:
@@ -160,7 +159,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         config.WELCOME_CAPTION, 
         parse_mode="HTML",
-        reply_markup=keyboard  # <-- Added keyboard
+        reply_markup=keyboard
     )
 
 
@@ -225,34 +224,37 @@ async def enter_the_hell(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Avoid duplicate lobbies when two /enterthehell commands arrive together.
     lock = _lobby_create_locks.setdefault(chat.id, asyncio.Lock())
-    async with lock:
-        existing = await get_active_match(chat.id)
-        if existing:
-            await message.reply_text("⚠️ A game is already running in this group!")
-            return
+    try:
+        async with lock:
+            existing = await get_active_match(chat.id)
+            if existing:
+                await message.reply_text("⚠️ A game is already running in this group!")
+                return
 
-        match = await create_match(chat.id, user.id)
-        mid = str(match["_id"])
-        match["lobby_deadline"] = time.time() + int(config.LOBBY_SECONDS)
+            match = await create_match(chat.id, user.id)
+            mid = str(match["_id"])
+            match["lobby_deadline"] = time.time() + int(config.LOBBY_SECONDS)
 
-        try:
-            msg = await message.reply_text(
-                _lobby_text(match, config.LOBBY_SECONDS),
-                reply_markup=ui.lobby_keyboard(mid, len(match.get("players", [])) >= config.MIN_PLAYERS),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-            match["lobby_message_id"] = msg.message_id
-            await save_match(match)
-        except Exception:
-            log.exception("Could not create lobby card for match %s", mid)
-            match["stage"] = "finished"
             try:
+                msg = await message.reply_text(
+                    _lobby_text(match, config.LOBBY_SECONDS),
+                    reply_markup=ui.lobby_keyboard(mid, len(match.get("players", [])) >= config.MIN_PLAYERS),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                match["lobby_message_id"] = msg.message_id
                 await save_match(match)
             except Exception:
-                log.exception("Could not mark failed lobby %s as finished", mid)
-            raise
-        runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
+                log.exception("Could not create lobby card for match %s", mid)
+                match["stage"] = "finished"
+                try:
+                    await save_match(match)
+                except Exception:
+                    log.exception("Could not mark failed lobby %s as finished", mid)
+                raise
+            runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
+    finally:
+        _lobby_create_locks.pop(chat.id, None)
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,15 +272,11 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not match or match.get("stage") != "lobby":
             response = ("Lobby is closed.", True)
         elif await is_user_in_other_active_match(uid, mid): 
-            response = ("⚠️ You are already in another active game!", True)
+            response = ("⚠️ You are already in another active game or lobby!", True)
         elif _lobby_seconds_left(match) <= 0:
             response = ("Lobby timer has expired. Please wait for it to close.", True)
         elif any(p.get("id") == uid for p in match.get("players", [])):
             response = ("You're already registered! 👥", False)
-        # --- NEW CHECK: PREVENT JOINING MULTIPLE LOBBIES ---
-        elif await matches.find_one({"stage": "lobby", "_id": {"$ne": match.get("_id")}, "players.id": uid}):
-            response = ("⚠️ You are already waiting in another lobby! You can only join one at a time.", True)
-        # ---------------------------------------------------
         elif len(match.get("players", [])) >= config.MAX_PLAYERS:
             response = (f"Game is full ({config.MAX_PLAYERS})!", True)
         else:
@@ -287,7 +285,6 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=uid,
                     text=(
                         "✅ You joined Squid Game! "
-        
                     ),
                 )
             except Forbidden:
@@ -465,8 +462,8 @@ async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat.id, text="👥 Use this command inside a GROUP!")
         return
 
-    # Define Bot Admin ID
-    BOT_ADMIN = 6439532660
+    # Fetch Admin ID from config or use fallback
+    BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
 
     match_stub = await get_active_match(chat.id)
     if not match_stub:
@@ -533,7 +530,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Optional: If you want only the bot admin to see stats, uncomment the lines below
-    # BOT_ADMIN = 6439532660
+    # BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
     # if update.effective_user.id != BOT_ADMIN:
     #     return
 
@@ -556,7 +553,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not user:
         return
 
-    # User ka ID nikal lein
     user_id = user.id
 
     text = (
@@ -570,7 +566,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /report - to report a bug and give a suggestion.\n"
     )
 
-    # Button ke data me user_id attach kar diya
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 Read Game Guide", callback_data=f"help:guide:{user_id}")]
     ])
@@ -590,7 +585,6 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     parts = data.split(":")
 
-    # Data check (e.g., help:guide:123456789)
     if len(parts) != 3 or parts[0] != "help":
         return
         
@@ -681,7 +675,9 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     report_text = args[1] if len(args) > 1 else "<i>(Media attached without extra text)</i>"
-    BOT_ADMIN = 6439532660  # Your Admin ID
+    
+    # Fetch Admin ID from config or use fallback
+    BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
 
     # Auto-detect location data
     chat_type = chat.type.capitalize()
