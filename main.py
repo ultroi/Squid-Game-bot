@@ -92,40 +92,43 @@ async def post_init(app: Application) -> None:
 
     await restore_lobby_timers(app)
     await manager.resume_pending_next_round_gates(app)
-    await manager.cleanup_interrupted_games(app)
+    cleanup_interrupted_games = getattr(manager, "cleanup_interrupted_games", None)
+    if cleanup_interrupted_games is not None:
+        await cleanup_interrupted_games(app)
+    else:
+        log.warning("manager.cleanup_interrupted_games is unavailable; skipping interrupted-game cleanup.")
     log.info("Pending next-round gates resumed.")
 
     # --- STARTUP DEPLOYMENT NOTIFICATION ---
     try:
-        # Your private updates channel ID
-        UPDATES_CHANNEL = "-1004325447119"
+        updates_channel = "-1004325447119"
 
-        # Fetch the latest Git commit message
         try:
-            # Runs 'git log -1 --pretty=format:%s' to get just the commit title
             commit_msg = subprocess.check_output(
-                ['git', 'log', '-1', '--pretty=format:%s'],
-                stderr=subprocess.STDOUT
-            ).decode('utf-8').strip()
+                ["git", "log", "-1", "--pretty=format:%s"],
+                stderr=subprocess.STDOUT,
+                timeout=3,
+            ).decode("utf-8", errors="replace").strip()
+            if not commit_msg:
+                commit_msg = "System restarted or updated manually."
         except Exception:
             commit_msg = "System restarted or updated manually."
 
-        # Format the notification message
         deploy_message = (
             "🚀 <b>Bot Restarted Successfully</b>\n\n"
             "🛠 <b>Latest Update:</b>\n"
             f"<code>{html.escape(commit_msg)}</code>"
         )
 
-        # Send to the channel
         await app.bot.send_message(
-            chat_id=UPDATES_CHANNEL,
+            chat_id=updates_channel,
             text=deploy_message,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
-        log.info("Startup notification sent to channel.")
-    except Exception as e:
-        log.warning(f"Could not send startup notification to channel: {e}")
+        log.info("Startup notification sent to the updates channel.")
+    except Exception as exc:
+        # A channel notification failure must never stop the bot startup.
+        log.warning("Could not send startup notification to channel: %s", exc)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

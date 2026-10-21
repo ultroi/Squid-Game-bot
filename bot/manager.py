@@ -454,6 +454,61 @@ async def game_finished(context, mid, survivor_ids, title):
         match["stage"] = "finished"
         match["next_round"] = {"status": "closed", "from_stage": previous_stage}
         await save_match(match)
+
+        # A card edit can fail without showing the result. Guarantee a plain
+        # group-message fallback when zero players survive any round.
+        game_state = match.get("game") or {}
+        if not game_state.get("final_group_result_message_id"):
+            result = (match.get("round_results") or {}).get(previous_stage) or {}
+            qualified_ids = result.get("qualified_ids") or []
+            eliminated_ids = result.get("eliminated_ids") or []
+            player_by_id = {
+                str(player.get("id")): player
+                for player in match.get("players", [])
+                if player.get("id") is not None
+            }
+
+            # Legacy match records may not have current-round IDs saved.
+            if not eliminated_ids:
+                fallback_ids = match.get("current_round_player_ids") or []
+                if not fallback_ids:
+                    game_players = game_state.get("players")
+                    if isinstance(game_players, dict):
+                        fallback_ids = list(game_players.keys())
+                eliminated_ids = fallback_ids
+
+            qualified_names = [
+                html.escape(str((player_by_id.get(str(uid)) or {}).get("name") or uid))
+                for uid in qualified_ids
+            ]
+            eliminated_names = [
+                html.escape(str((player_by_id.get(str(uid)) or {}).get("name") or uid))
+                for uid in eliminated_ids
+            ]
+            fallback_text = (
+                f"🏁 <b>{html.escape(str(title))} — FINAL RESULTS</b>\n\n"
+                f"✅ <b>Qualified ({len(qualified_ids)}):</b> "
+                f"{', '.join(qualified_names) if qualified_names else 'None'}\n"
+                f"💀 <b>Eliminated ({len(eliminated_ids)}):</b> "
+                f"{', '.join(eliminated_names) if eliminated_names else 'None'}\n\n"
+                "❌ <b>No players qualified.</b> The match is over; no next-round entry will open."
+            )
+            try:
+                result_message = await group_send(
+                    context,
+                    match,
+                    fallback_text,
+                        disable_web_page_preview=True,
+                )
+                if result_message:
+                    game_state["final_group_result_message_id"] = result_message.message_id
+                    match["game"] = game_state
+                    await save_match(match)
+            except Exception:
+                log.exception(
+                    "Could not send zero-survivor result message (match=%s)", mid
+                )
+
         await refresh_lobby_scoreboard(context, mid, force=True)
         runtime.clear(mid)
         return
@@ -664,8 +719,7 @@ async def _close_next_round_gate(context, mid, force=False):
                     message_id=gate_message_id,
                     text=closed_text,
                     parse_mode=ParseMode.HTML,
-                    reply_markup=ui.kb([]),
-                    disable_web_page_preview=True,
+                        disable_web_page_preview=True,
                 )
             except Exception:
                 log.exception("Could not close entry-gate message %s", gate_message_id)

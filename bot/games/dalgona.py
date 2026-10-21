@@ -719,19 +719,150 @@ async def on_press(update, context) -> None:
                 event.set()
 
 
+async def _send_final_group_result(context, match: dict, survivors: list[int]) -> bool:
+    """Send a standalone Dalgona result, even if nobody qualifies.
+
+    This message does not depend on editing the image-backed Rich Message.
+    """
+    game = match.setdefault("game", {})
+    if game.get("final_group_result_message_id"):
+        return True
+
+    players = match.get("players", [])
+    survivor_ids = {str(uid) for uid in (survivors or [])}
+    game_players = game.get("players") or {}
+    participant_ids = (
+        {str(uid) for uid in game_players.keys()}
+        if isinstance(game_players, dict) else set()
+    )
+    if not participant_ids:
+        participant_ids = {
+            str(uid) for uid in (match.get("current_round_player_ids") or [])
+        }
+    if not participant_ids:
+        # Legacy fallback: do not produce a blank results message if round IDs
+        # were not persisted by an older match version.
+        participant_ids = {
+            str(player.get("id")) for player in players
+            if player.get("id") is not None
+        }
+
+    qualified_players = [
+        player for player in players
+        if str(player.get("id")) in survivor_ids
+        and str(player.get("id")) in participant_ids
+        and player.get("alive", True)
+    ]
+    qualified_ids = {str(player.get("id")) for player in qualified_players}
+    eliminated_players = [
+        player for player in players
+        if str(player.get("id")) in participant_ids
+        and str(player.get("id")) not in qualified_ids
+    ]
+
+    qualified_names = ", ".join(
+        html.escape(str(player.get("name") or player.get("id")))
+        for player in qualified_players
+    ) or "None"
+    eliminated_names = ", ".join(
+        html.escape(str(player.get("name") or player.get("id")))
+        for player in eliminated_players
+    ) or "None"
+
+    lines = [
+        "🍪 <b>DALGONA CANDY — FINAL RESULTS</b>",
+        "",
+        f"✅ <b>Qualified ({len(qualified_players)}):</b> {qualified_names}",
+        f"💀 <b>Eliminated ({len(eliminated_players)}):</b> {eliminated_names}",
+    ]
+    if not qualified_players:
+        lines.extend([
+            "",
+            "❌ <b>No one qualified.</b>",
+            "The match is over; no next-round entry will open.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "➡️ Qualified players can enter the next round from the group message.",
+        ])
+
+    for attempt in range(3):
+        try:
+            message = await context.bot.send_message(
+                chat_id=match["chat_id"],
+                text="\n".join(lines),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            game["final_group_result_message_id"] = message.message_id
+            await save_match(match)
+            return True
+        except RetryAfter as exc:
+            delay = getattr(exc, "retry_after", 1)
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            if attempt < 2:
+                await asyncio.sleep(max(0.0, float(delay)) + 0.2)
+                continue
+            log.error(
+                "Dalgona final result send was rate-limited repeatedly (match=%s)",
+                match.get("_id"),
+            )
+        except TelegramError:
+            log.exception(
+                "Could not send Dalgona final group result (match=%s)",
+                match.get("_id"),
+            )
+            break
+        except Exception:
+            log.exception(
+                "Unexpected error sending Dalgona final group result (match=%s)",
+                match.get("_id"),
+            )
+            break
+    return False
+
+
 async def _finish(context, mid: str, survivors: list[int]) -> None:
-    """Transition to next mini-game and ensure group receives the final results."""
+    """Finalize Dalgona, publish results, and continue the manager lifecycle."""
     match = await get_match(mid)
     if not match or match.get("stage") != "dalgona":
         return
-        
-    # Mark the game as finished internally
-    match.setdefault("game", {})["round_finished"] = True
+
+    game = match.setdefault("game", {})
+    game["round_finished"] = True
+
+    # When everybody is eliminated, deriving entrants from live players returns
+    # an empty set. Restore this round's participant IDs from Dalgona player state.
+    existing_entrants = {
+        str(uid) for uid in (match.get("current_round_player_ids") or [])
+    }
+    if not existing_entrants:
+        state_players = game.get("players") or {}
+        state_ids = set(state_players.keys()) if isinstance(state_players, dict) else set()
+        entrants = [
+            player.get("id") for player in match.get("players", [])
+            if player.get("id") is not None
+            and str(player.get("id")) in state_ids
+        ]
+        if entrants:
+            match["current_round_player_ids"] = entrants
+
     await save_match(match)
-    
-    # UI refresh ko time do taaki Telegram limit hit na kare aur result dikh sake
-    await ui.refresh_round_announcement(context.bot, match, "dalgona", finished=True)
-    await asyncio.sleep(1.5)  # Telegram API ko result show karne ka thoda time de
-    
-    # Manager ke game_finished ko call karein jo next round ka button banayega
+
+    # Best-effort update to the image-backed announcement. The standalone result
+    # below remains the authoritative result if this Rich Message edit fails.
+    try:
+        await ui.refresh_round_announcement(
+            context.bot, match, "dalgona", finished=True
+        )
+    except Exception:
+        log.exception(
+            "Could not edit Dalgona round announcement (match=%s)", mid
+        )
+
+    latest = await get_match(mid)
+    if latest and latest.get("stage") == "dalgona":
+        await _send_final_group_result(context, latest, survivors)
     await game_finished(context, mid, survivors, "Dalgona Candy")
