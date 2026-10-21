@@ -144,29 +144,6 @@ async def edit_rich_message(
     return await bot._post("editMessageText", data=data)
 
 
-async def edit_rich_message_image(
-    bot, chat_id, message_id, rich_html, image_url, *, image_index=0, media=None
-):
-    updated_html = replace_rich_image(rich_html, image_url, index=image_index)
-    return await edit_rich_message(
-        bot, chat_id, message_id, updated_html, media=media
-    )
-
-
-async def edit_rich_message_photo(
-    bot, chat_id, message_id, rich_html, media_source, *, media_id="main_photo", media=None
-):
-    photo_ref = rich_photo_reference(media_id)
-    updated_html = _set_rich_image_src(rich_html, photo_ref)
-    media_items = [
-        item for item in (media or [])
-        if not isinstance(item, dict) or str(item.get("id")) != str(media_id)
-    ]
-    media_items.append(rich_photo_media(media_id, media_source))
-    return await edit_rich_message(
-        bot, chat_id, message_id, updated_html, media=media_items
-    )
-
 def _match_board_text(match):
     players = match.get("players") or []
     results = match.get("round_results") or {}

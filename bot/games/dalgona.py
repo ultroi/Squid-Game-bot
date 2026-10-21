@@ -5,7 +5,7 @@ import asyncio
 import logging
 import random
 import time
-
+import html
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from .. import runtime, ui, config
@@ -486,7 +486,25 @@ async def _run_game(context, mid: str) -> None:
                 await save_match(match)
 
                 event = asyncio.Event()
-                runtime.get(mid)["dalgona_wave_event"] = event
+                rt = runtime.get(mid)
+                rt["dalgona_wave_event"] = event
+                
+                # --- IN-MEMORY TRACKER INITIALIZATION ---
+                rt["dalgona_tracker"] = {
+                    "round_index": shape_idx,
+                    "sequence": sequence,
+                    "players": {
+                        str(player["id"]): {
+                            "progress": 0,
+                            "done": False,
+                            "alive": True,
+                            "dm_mid": player_states.get(str(player["id"]), {}).get("dm_mid")
+                        }
+                        for player in alive_players
+                        if isinstance(player_states.get(str(player["id"])), dict)
+                    }
+                }
+                # ----------------------------------------
 
             input_actions = [
                 safe_edit(
@@ -505,7 +523,6 @@ async def _run_game(context, mid: str) -> None:
                 # Wait for either the timeout or all players to finish via the event
                 await asyncio.wait_for(event.wait(), timeout=input_seconds)
             except asyncio.TimeoutError:
-                # Expected when time runs out. The logic below handles it safely.
                 pass
             except Exception as e:
                 log.exception(f"Unexpected error during Dalgona timer: {e}")
@@ -542,7 +559,13 @@ async def _run_game(context, mid: str) -> None:
                             )
 
                 game["sequence_phase"] = "resolved"
-                runtime.get(mid)["dalgona_wave_event"] = None
+                
+                # Cleanup runtime keys
+                rt = runtime.get(mid)
+                if rt:
+                    rt["dalgona_wave_event"] = None
+                    rt.pop("dalgona_tracker", None)
+                    
                 await save_match(match)
 
             # Get final survivors
@@ -556,22 +579,12 @@ async def _run_game(context, mid: str) -> None:
                 f"✅ {len(survivors)} Survived\n"
                 f"💀 {timed_out_count} Eliminated"
             )
-            # Event ko update karein taaki msg-1 me dikhe
+            
             await _refresh_group(context, mid, event=result_str, finished=True)
-            await asyncio.sleep(2.0)  # Thoda aur lamba pause dein
-
-            # Single shape mode: Finish immediately
-            survivor_ids = [p["id"] for p in survivors]
-            await _finish(context, mid, survivor_ids)
-            return
-
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("Dalgona coordinator failed")
+            await asyncio.sleep(2.0)
 
 async def on_press(update, context) -> None:
-    """Validate callbacks and safely process private-grid taps."""
+    """Validate callbacks and safely process private-grid taps using fast in-memory tracking."""
     query = getattr(update, "callback_query", None)
     if not query:
         return
@@ -581,11 +594,10 @@ async def on_press(update, context) -> None:
         await safe_answer(query, "Invalid Dalgona button.", True)
         return
 
-    _, mid, round_text, cell_text = parts
     try:
-        round_index = int(round_text)
-        cell = int(cell_text)
-    except (TypeError, ValueError):
+        round_index = int(parts[2])
+        cell = int(parts[3])
+    except ValueError:
         await safe_answer(query, "Invalid tile. Please use the numbered grid.", True)
         return
 
@@ -593,130 +605,80 @@ async def on_press(update, context) -> None:
         await safe_answer(query, "Invalid tile. Choose a number from 1 to 9.", True)
         return
 
+    mid = parts[1]
     uid = query.from_user.id
+    uid_str = str(uid)
 
-    async with _state_lock(mid):
-        match = await get_match(mid)
-        if not match or match.get("stage") != "dalgona":
-            await safe_answer(query, "This Dalgona round is no longer active.", True)
-            return
+    rt = runtime.get(mid)
+    tracker = rt.get("dalgona_tracker") if rt else None
 
-        game = match.get("game") or {}
-        if game.get("sequence_phase") != "input":
-            await safe_answer(query, "Controls are not active yet!", True)
-            return
+    # O(1) Memory Validation
+    if not tracker:
+        await safe_answer(query, "Controls are not active yet or round expired.", True)
+        return
 
-        try:
-            current_round = int(game.get("current_shape_index", -1))
-        except (TypeError, ValueError):
-            current_round = -1
-        if round_index != current_round:
-            await safe_answer(query, "These buttons are from an earlier pattern.", True)
-            return
+    if round_index != tracker["round_index"]:
+        await safe_answer(query, "These buttons are from an earlier pattern.", True)
+        return
 
-        player = get_player(match, uid)
-        game_players = game.get("players") or {}
-        state = game_players.get(str(uid)) if isinstance(game_players, dict) else None
+    player_state = tracker["players"].get(uid_str)
+    if not player_state or not player_state["alive"]:
+        await safe_answer(query, "You are eliminated or not in this match.", True)
+        return
 
-        if not player or not player.get("alive", True):
-            await safe_answer(query, "You are eliminated or not in this match.", True)
+    # Use a PER-PLAYER lock to prevent rapid double-tap race conditions
+    player_lock = rt.setdefault("dalgona_player_locks", {}).setdefault(uid_str, asyncio.Lock())
+
+    async with player_lock:
+        # Re-check state inside the lock
+        if not player_state["alive"]:
+            await safe_answer(query, "You are already eliminated.", True)
             return
-        if not isinstance(state, dict):
-            log.warning(
-                "Dalgona player state missing during tap: match=%s user=%s",
-                mid,
-                uid,
-            )
-            await safe_answer(
-                query,
-                "Your game state is unavailable. Please wait for the next update.",
-                True,
-            )
-            return
-        if state.get("done"):
+        if player_state["done"]:
             await safe_answer(query, "You have already cleared this pattern. ✅", True)
             return
 
-        sequence = game.get("current_sequence")
-        if not isinstance(sequence, list) or not sequence:
-            await safe_answer(query, "The pattern is unavailable. Please wait.", True)
-            log.error("Dalgona input phase has no sequence (match=%s)", mid)
-            return
-
-        try:
-            progress = int(state.get("progress", 0))
-        except (TypeError, ValueError):
-            await safe_answer(query, "Your progress state is invalid. Please wait.", True)
-            log.error("Invalid Dalgona progress (match=%s user=%s)", mid, uid)
-            return
+        sequence = tracker["sequence"]
+        progress = player_state["progress"]
 
         if progress < 0 or progress >= len(sequence):
-            await safe_answer(query, "Your pattern state has expired. Please wait.", True)
-            log.warning(
-                "Dalgona progress out of bounds (match=%s user=%s progress=%s length=%s)",
-                mid,
-                uid,
-                progress,
-                len(sequence),
-            )
+            await safe_answer(query, "Your pattern state has expired.", True)
             return
 
+        # Evaluate the tap
         if cell != sequence[progress]:
-            player["alive"] = False
-            state["phase"] = "dead"
+            player_state["alive"] = False
             await safe_answer(query, "❌ Wrong tile! Your candy broke.", True)
-            await safe_edit(
-                context.bot,
-                uid,
-                state.get("dm_mid"),
-                "💥💀 <b>ELIMINATED!</b> You tapped the wrong tile.",
+            await safe_edit(context.bot, uid, player_state.get("dm_mid"), "💥💀 <b>ELIMINATED!</b> You tapped the wrong tile.")
+            
+            # Execute targeted atomic DB update directly
+            await update_dalgona_tap(
+                mid, uid, {"alive": False}, {"progress": progress, "done": False, "phase": "dead"}
             )
         else:
-            state["progress"] = progress + 1
-            if state["progress"] >= len(sequence):
-                state["done"] = True
+            player_state["progress"] += 1
+            if player_state["progress"] >= len(sequence):
+                player_state["done"] = True
                 await safe_answer(query, "✅ Pattern cleared!", True)
-                await safe_edit(
-                    context.bot,
-                    uid,
-                    state.get("dm_mid"),
-                    "✅ <b>Pattern cleared!</b> Wait in the group for the next round.",
+                await safe_edit(context.bot, uid, player_state.get("dm_mid"), "✅ <b>Pattern cleared!</b> Wait in the group for the next round.")
+                
+                await update_dalgona_tap(
+                    mid, uid, {"alive": True}, {"progress": player_state["progress"], "done": True, "phase": "input"}
                 )
             else:
-                await safe_answer(query, f"✅ {state['progress']}/{len(sequence)}")
+                await safe_answer(query, f"✅ {player_state['progress']}/{len(sequence)}")
+                await update_dalgona_tap(
+                    mid, uid, {"alive": True}, {"progress": player_state["progress"], "done": False, "phase": "input"}
+                )
 
-        # Persist only this player's relevant fields.
-        await update_dalgona_tap(
-            mid,
-            uid,
-            {"alive": player.get("alive", True)},
-            {
-                "progress": state["progress"],
-                "done": state.get("done", False),
-                "phase": state.get("phase", "input"),
-            },
-        )
+    # Globally check if the wave is finished purely from memory
+    alive_players = [p for p in tracker["players"].values() if p["alive"]]
+    all_alive_done = all(p["done"] for p in alive_players)
 
-        # RE-FETCH the match to get the live updated state of ALL players
-        live_match = await get_match(mid)
-        live_game_players = (live_match.get("game") or {}).get("players") or {}
-        
-        alive_players = [
-            candidate for candidate in live_match.get("players", [])
-            if candidate.get("alive", True)
-        ]
-        
-        # Check if everyone who is still alive has completed the pattern
-        all_alive_done = all(
-            isinstance(live_game_players.get(str(candidate.get("id"))), dict)
-            and live_game_players[str(candidate["id"])].get("done", False)
-            for candidate in alive_players
-        )
-        
-        if not alive_players or all_alive_done:
-            event = runtime.get(mid).get("dalgona_wave_event")
-            if event:
-                event.set()
+    if not alive_players or all_alive_done:
+        event = rt.get("dalgona_wave_event")
+        if event:
+            event.set()
 
 
 async def _send_final_group_result(context, match: dict, survivors: list[int]) -> bool:

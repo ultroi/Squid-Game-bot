@@ -2,7 +2,7 @@
 import asyncio
 import random
 import html
-import logging
+import logging as _lg
 from .. import config, runtime, ui
 from ..manager import safe_edit, safe_answer, game_finished
 from ..repository import get_match, save_match, alive, get_player, pname
@@ -121,7 +121,6 @@ async def _run_round(context, mid):
     except asyncio.CancelledError:
         raise
     except Exception:
-        from .. import logging as _lg
         _lg.getLogger(__name__).exception("Marbles run_round crashed")
 
 
