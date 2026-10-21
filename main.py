@@ -116,8 +116,7 @@ async def post_init(app: Application) -> None:
 
         deploy_message = (
             "🚀 <b>Bot Restarted Successfully</b>\n\n"
-            "🛠 <b>Latest Update:</b>\n"
-            f"<code>{html.escape(commit_msg)}</code>"
+            
         )
 
         await app.bot.send_message(

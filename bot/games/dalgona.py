@@ -583,6 +583,24 @@ async def _run_game(context, mid: str) -> None:
             await _refresh_group(context, mid, event=result_str, finished=True)
             await asyncio.sleep(2.0)
 
+    except asyncio.CancelledError:
+        # Preserve task cancellation during shutdown or match cleanup.
+        raise
+    except Exception:
+        log.exception("Dalgona game loop crashed (match=%s)", mid)
+        # Do not leave the match stuck in Dalgona if an unexpected error occurs.
+        try:
+            latest = await get_match(mid)
+            if latest and latest.get("stage") == "dalgona":
+                survivors = [
+                    player["id"] for player in latest.get("players", [])
+                    if player.get("alive", True) and player.get("id") is not None
+                ]
+                await _finish(context, mid, survivors)
+        except Exception:
+            log.exception("Could not finalize Dalgona after loop failure (match=%s)", mid)
+
+
 async def on_press(update, context) -> None:
     """Validate callbacks and safely process private-grid taps using fast in-memory tracking."""
     query = getattr(update, "callback_query", None)
