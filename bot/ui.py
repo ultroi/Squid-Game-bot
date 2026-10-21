@@ -688,48 +688,57 @@ async def send_round_result_message(bot, match, stage=None, event=None):
 
 async def refresh_round_announcement(bot, match, stage=None, details=None, event=None, finished=False, reply_markup=None):
     stage = stage or match.get("round_message_stage") or match.get("stage", "unknown")
+    
+    # 1. Generate text (yeh automatically finished=True hone par 'ROUND COMPLETE' likh dega)
+    text = round_status_text(match, stage, details=details, event=event, finished=finished)
+    message_id = match.get("round_message_id")
+    
+    current_markup = kb([]) if finished else reply_markup
+
+    # 2. Purane Round Announcement Card ko Edit karein
+    if not message_id:
+        if not finished:  # Agar message nahi hai aur round chal raha hai tabhi naya announcement bhejein
+            message = await _send_round_message(
+                bot, match["chat_id"], stage, text, reply_markup=current_markup
+            )
+            match["round_message_id"] = message.message_id
+            match["round_message_stage"] = stage
+            from .repository import save_match
+            await save_match(match)
+    else:
+        for attempt in range(2):
+            try:
+                await _edit_round_message(
+                    bot,
+                    match["chat_id"],
+                    message_id,
+                    stage,
+                    text,
+                    reply_markup=current_markup,
+                )
+                break
+            except BadRequest as exc:
+                if "message is not modified" in str(exc).lower():
+                    break
+                log.warning("Round announcement edit failed for %s: %s", stage, exc)
+                break
+            except RetryAfter as exc:
+                if attempt == 0:
+                    delay = getattr(exc, "retry_after", 1)
+                    if hasattr(delay, "total_seconds"):
+                        delay = delay.total_seconds()
+                    await asyncio.sleep(float(delay) + 0.2)
+                else:
+                    break
+            except TelegramError:
+                log.exception("Round announcement edit failed for %s", stage)
+                break
+
+    # 3. Purana card update hone ke baad, NAYA Standalone Result message GC me bhejein
     if finished:
         return await send_round_result_message(bot, match, stage=stage, event=event)
 
-    text = round_status_text(match, stage, details=details, event=event, finished=False)
-    message_id = match.get("round_message_id")
-
-    if not message_id:
-        message = await _send_round_message(
-            bot, match["chat_id"], stage, text, reply_markup=reply_markup
-        )
-        match["round_message_id"] = message.message_id
-        match["round_message_stage"] = stage
-        from .repository import save_match
-        await save_match(match)
-        return True
-
-    for attempt in range(2):
-        try:
-            await _edit_round_message(
-                bot,
-                match["chat_id"],
-                message_id,
-                stage,
-                text,
-                reply_markup=reply_markup,
-            )
-            return True
-        except BadRequest as exc:
-            if "message is not modified" in str(exc).lower():
-                return True
-            log.warning("Round announcement edit failed for %s: %s", stage, exc)
-            return False
-        except RetryAfter as exc:
-            if attempt == 0:
-                delay = getattr(exc, "retry_after", 1)
-                await asyncio.sleep(float(getattr(delay, "total_seconds", lambda: delay)()) + 0.2)
-            else:
-                return False
-        except TelegramError:
-            log.exception("Round announcement edit failed for %s", stage)
-            return False
-    return False
+    return True
 
 
 # ---------- red light green light ----------
