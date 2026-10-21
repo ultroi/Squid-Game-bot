@@ -282,17 +282,133 @@ async def _refresh_group_round(context, mid, light=None, event=None, finished=Fa
 
 # ---------------------------------------------------------------- begin
 
+async def _send_player_board(context, mid, match, rt, player, render_context,
+                            phase_token, state_version):
+    """Create a player's initial private board, retrying transient Telegram failures."""
+    user_id = player.get("id")
+    content = ui.rlgl_dm_html(
+        match,
+        user_id,
+        "green",
+        config.RLGL_SECONDS,
+        match_id=mid,
+        phase_token=phase_token,
+        image_url=match.get("rlgl_image_url"),
+        ctx=render_context,
+    )
+
+    for attempt in range(3):
+        try:
+            await _EDIT_LIMITER.acquire()
+            async with _UI_IO_SEMAPHORE:
+                result = await ui.send_rlgl_rich_message(context.bot, user_id, content)
+
+            message_id = _message_id(result)
+            if not message_id:
+                raise RuntimeError("Initial RLGL message did not return a message ID")
+
+            player["dm_mid"] = message_id
+            uid = _uid_key(user_id)
+            rt["player_phase_tokens"][uid] = phase_token
+            rt["player_rendered_version"][uid] = state_version
+            rt["last_dm_refresh"][uid] = time.monotonic()
+            return True
+        except RetryAfter as exc:
+            await asyncio.sleep(_retry_seconds(exc) + 0.2)
+        except Exception:
+            log.warning(
+                "Could not send initial RLGL board (match=%s, user=%s, attempt=%s)",
+                mid, user_id, attempt + 1, exc_info=True,
+            )
+            if attempt < 2:
+                await asyncio.sleep(0.5)
+
+    player["alive"] = False
+    return False
+
+
+async def _countdown_to_race(context, mid):
+    """Update the group announcement while private controls are being prepared."""
+    for remaining in (4, 3, 2, 1):
+        await asyncio.sleep(1)
+        match = await get_match(mid)
+        if not match or match.get("stage") != "rlgl":
+            return None
+
+        await ui.refresh_round_announcement(
+            context.bot,
+            match,
+            "rlgl",
+            details=f"⏳ <b>Private race starts in {remaining} seconds</b>",
+            event="The race is getting ready.",
+            reply_markup=ui.kb([]),
+        )
+
+    await asyncio.sleep(1)
+    match = await get_match(mid)
+    if not match or match.get("stage") != "rlgl":
+        return None
+
+    await ui.refresh_round_announcement(
+        context.bot,
+        match,
+        "rlgl",
+        details="📩 <b>Opening private race controls…</b>",
+        event="Preparing private race controls.",
+        reply_markup=ui.kb([]),
+    )
+    return match
+
+
+def _race_start_event(players):
+    """Describe players who could not receive a private race board."""
+    unreachable = [player for player in players if not player.get("dm_mid")]
+    if not unreachable:
+        return "The race has started."
+
+    names = ", ".join(str(p.get("name") or p.get("id")) for p in unreachable[:3])
+    extra = f" +{len(unreachable) - 3}" if len(unreachable) > 3 else ""
+    return f"The race has started. DM unreachable, disqualified: {names}{extra}"
+
+
+async def _activate_race(context, mid, match, rt, start_event, dm_markup):
+    """Persist the starting state and publish the live race status."""
+    async with rt["lock"]:
+        rt["grid"] = _hydrate_grid(match)
+        rt["match_snapshot"] = match
+        match["game"]["started_at"] = time.time()
+        match["game"]["last_event"] = start_event
+        match["round_preparing"] = False
+        rt["state_version"] += 1
+        await save_match(match)
+
+    await refresh_lobby_scoreboard(context, mid, force=True)
+    await _refresh_group_round(
+        context,
+        mid,
+        "green",
+        event=start_event,
+        reply_markup=dm_markup,
+        force=True,
+    )
+
+
 async def begin(context, mid):
+    """Set up the race, deliver private boards, and start background workers."""
     match = await get_match(mid)
     if not match:
         return
+
     players = alive(match)
     if not players:
         return
 
-    size = max(1, int(config.GRID_SIZE))
+    grid_size = max(1, int(config.GRID_SIZE))
     for index, player in enumerate(players):
-        player["pos"] = [size - 1 - (index // size), index % size]
+        player["pos"] = [
+            grid_size - 1 - (index // grid_size),
+            index % grid_size,
+        ]
         player["reached"] = False
         player.pop("dm_mid", None)
         player.pop("dm_image_mid", None)
@@ -308,115 +424,52 @@ async def begin(context, mid):
     rt = runtime.get(mid)
     async with rt["lock"]:
         _initialize_round_runtime(rt, match)
-        initial_token = rt["phase_token"]
-        initial_version = rt["state_version"]
+        phase_token = rt["phase_token"]
+        state_version = rt["state_version"]
 
     runtime.add_task(mid, asyncio.create_task(_prewarm_images()))
-
     await refresh_lobby_scoreboard(context, mid)
     dm_markup = await _open_dm_markup(context, rt)
 
     await ui.send_round_announcement(
-        context.bot, match, "rlgl",
+        context.bot,
+        match,
+        "rlgl",
         details="⏳ <b>Private race starts in 5 seconds</b>",
         event="The race is getting ready.",
     )
     await save_match(match)
 
-    for remaining in (4, 3, 2, 1):
-        await asyncio.sleep(1)
-        latest = await get_match(mid)
-        if not latest or latest.get("stage") != "rlgl":
-            return
-        await ui.refresh_round_announcement(
-            context.bot, latest, "rlgl",
-            details=f"⏳ <b>Private race starts in {remaining} seconds</b>",
-            event="The race is getting ready.",
-            reply_markup=ui.kb([]),
-        )
-
-    await asyncio.sleep(1)
-    match = await get_match(mid)
-    if not match or match.get("stage") != "rlgl":
+    match = await _countdown_to_race(context, mid)
+    if not match:
         return
+
     players = alive(match)
-
-    await ui.refresh_round_announcement(
-        context.bot, match, "rlgl",
-        details="📩 <b>Opening private race controls…</b>",
-        event="Preparing private race controls.",
-        reply_markup=ui.kb([]),
-    )
-
-    # Every board is rendered from the same snapshot, so build the shared part once.
-    start_ctx = ui.rlgl_render_context(match, "green")
-
-    async def send_player_board(player):
-        user_id = player.get("id")
-        rich_html = ui.rlgl_dm_html(
-            match, user_id, "green", config.RLGL_SECONDS,
-            match_id=mid, phase_token=initial_token,
-            image_url=match.get("rlgl_image_url"), ctx=start_ctx,
+    render_context = ui.rlgl_render_context(match, "green")
+    await asyncio.gather(*(
+        _send_player_board(
+            context, mid, match, rt, player, render_context,
+            phase_token, state_version,
         )
-        for attempt in range(3):
-            try:
-                await _EDIT_LIMITER.acquire()
-                async with _UI_IO_SEMAPHORE:
-                    result = await ui.send_rlgl_rich_message(context.bot, user_id, rich_html)
-                message_id = _message_id(result)
-                if not message_id:
-                    raise RuntimeError("No message_id")
-                player["dm_mid"] = message_id
-                rt["player_phase_tokens"][_uid_key(user_id)] = initial_token
-                rt["player_rendered_version"][_uid_key(user_id)] = initial_version
-                rt["last_dm_refresh"][_uid_key(user_id)] = time.monotonic()
-                return True
-            except RetryAfter as exc:
-                await asyncio.sleep(_retry_seconds(exc) + 0.2)
-            except Exception:
-                if attempt == 2:
-                    break
-                await asyncio.sleep(0.5)
-        player["alive"] = False
-        return False
+        for player in players
+    ))
 
-    await asyncio.gather(*(send_player_board(p) for p in players))
+    start_event = _race_start_event(players)
+    await _activate_race(context, mid, match, rt, start_event, dm_markup)
 
-    unreachable = [p for p in players if not p.get("dm_mid")]
-    start_event = "The race has started."
-    if unreachable:
-        names = ", ".join(str(p.get("name") or p.get("id")) for p in unreachable[:3])
-        extra = f" +{len(unreachable) - 3}" if len(unreachable) > 3 else ""
-        start_event = f"The race has started. DM unreachable, disqualified: {names}{extra}"
-
-    async with rt["lock"]:
-        rt["grid"] = _hydrate_grid(match)
-        rt["match_snapshot"] = match
-        match["game"]["started_at"] = time.time()
-        match["game"]["last_event"] = start_event
-        match["round_preparing"] = False
-        rt["state_version"] += 1
-        await save_match(match)
-
-    await refresh_lobby_scoreboard(context, mid, force=True)
-    await _refresh_group_round(
-        context, mid, "green", event=start_event,
-        reply_markup=dm_markup, force=True,
-    )
-
-    if not any(_is_racing(g) for g in rt["grid"].values()):
-        # Nobody could be reached; do not wait for the timer.
+    if not any(_is_racing(player) for player in rt["grid"].values()):
         await _finish_round(context, mid, [], timed_out=True)
         return
 
-    for coro in (
+    workers = (
         _light_loop(context, mid),
         _housekeeping_loop(context, mid),
         _move_tick_loop(context, mid),
         _render_worker(context, mid),
         _persist_loop(context, mid),
-    ):
-        runtime.add_task(mid, asyncio.create_task(coro))
+    )
+    for worker in workers:
+        runtime.add_task(mid, asyncio.create_task(worker))
 
 
 # ---------------------------------------------------------------- move tick (memory only)
@@ -454,12 +507,81 @@ async def _move_tick_loop(context, mid):
                 break
 
 
+def _apply_one_move(rt, grid, move, grid_size):
+    """Apply one validated move and return its effect on the batch state."""
+    uid = str(move["uid"])
+    player = grid.get(uid)
+    if player is None:
+        _resolve_move(move, "You are not in this race.", True)
+        return False, False, None
+
+    if not player["alive"]:
+        _resolve_move(move, "❌ You are eliminated.")
+        return False, False, None
+
+    if player["reached"]:
+        _resolve_move(move, "🏁 You already finished.")
+        return False, False, None
+
+    status, light = _resolve_button_phase(rt, move["uid"], move["token"])
+    if status != "ok":
+        _mark_dirty(rt, uid, URGENT)
+        _resolve_move(move, "⚠️ Controls were out of date — refreshing.")
+        return False, False, None
+
+    if light == "red":
+        player["alive"] = False
+        event = (
+            f"{player.get('emoji') or '👤'} {player.get('name') or 'A player'} "
+            "moved on red and was eliminated."
+        )
+        _mark_dirty(rt, uid, URGENT)
+        rt["group_dirty"] = True
+        _resolve_move(move, "💀 You moved on red!", True)
+        return True, True, event
+
+    row, col = player["pos"]
+    if move["direction"] == "up":
+        new_row, new_col = max(0, row - 1), col
+    elif move["direction"] == "left":
+        new_row, new_col = row, max(0, col - 1)
+    else:
+        new_row, new_col = row, min(grid_size - 1, col + 1)
+
+    if (new_row, new_col) == (row, col):
+        _resolve_move(move, "⛔ Edge of the track.")
+        return False, False, None
+
+    player["pos"] = [new_row, new_col]
+    if new_row == 0:
+        player["reached"] = True
+        event = (
+            f"{player.get('emoji') or '👤'} {player.get('name') or 'A player'} "
+            "reached the finish line."
+        )
+        rt["group_dirty"] = True
+        _mark_dirty(rt, uid, URGENT)
+        _resolve_move(move, "🏁 You reached the finish!")
+        return True, True, event
+
+    _mark_dirty(rt, uid, MOVER)
+    _resolve_move(
+        move,
+        f"📍 {new_row} step{'s' if new_row != 1 else ''} to go",
+    )
+    return True, False, None
+
+
 async def _apply_moves(context, mid, moves):
+    """Apply queued moves atomically, then persist and publish terminal results."""
     rt = runtime.get(mid)
     snapshot = rt.get("match_snapshot")
+    game = (snapshot or {}).get("game") or {}
     if (
-        rt.get("done") or rt.get("round_finalizing") or not snapshot
-        or not (snapshot.get("game") or {}).get("started_at")
+        rt.get("done")
+        or rt.get("round_finalizing")
+        or not snapshot
+        or not game.get("started_at")
     ):
         for move in moves:
             _resolve_move(move, "The round is not active.")
@@ -467,10 +589,6 @@ async def _apply_moves(context, mid, moves):
 
     race_ended = False
     qualifiers = []
-    last_event = None
-    state_changed = False
-    touched = False
-
     async with rt["lock"]:
         if rt.get("done") or rt.get("round_finalizing"):
             for move in moves:
@@ -478,88 +596,37 @@ async def _apply_moves(context, mid, moves):
             return
 
         grid = rt.get("grid") or {}
-        size = max(1, int(config.GRID_SIZE))
+        grid_size = max(1, int(config.GRID_SIZE))
+        touched = False
+        state_changed = False
+        last_event = None
 
         for move in moves:
-            uid = str(move["uid"])
-            g = grid.get(uid)
-            if not g:
-                _resolve_move(move, "You are not in this race.", True)
-                continue
-            if not g["alive"]:
-                _resolve_move(move, "❌ You are eliminated.")
-                continue
-            if g["reached"]:
-                _resolve_move(move, "🏁 You already finished.")
-                continue
-
-            status, phase_light = _resolve_button_phase(rt, move["uid"], move["token"])
-            if status != "ok":
-                _mark_dirty(rt, uid, URGENT)
-                _resolve_move(move, "⚠️ Controls were out of date — refreshing.")
-                continue
-
-            if phase_light == "red":
-                g["alive"] = False
-                last_event = (
-                    f"{g.get('emoji') or '👤'} {g.get('name') or 'A player'} "
-                    "moved on red and was eliminated."
-                )
-                _mark_dirty(rt, uid, URGENT)
-                rt["group_dirty"] = True
-                state_changed = True
-                touched = True
-                _resolve_move(move, "💀 You moved on red!", True)
-                continue
-
-            row, col = g["pos"]
-            if move["direction"] == "up":
-                new_row, new_col = max(0, row - 1), col
-            elif move["direction"] == "left":
-                new_row, new_col = row, max(0, col - 1)
-            else:
-                new_row, new_col = row, min(size - 1, col + 1)
-
-            if (new_row, new_col) == (row, col):
-                _resolve_move(move, "⛔ Edge of the track.")
-                continue
-
-            g["pos"] = [new_row, new_col]
-            touched = True
-            if new_row == 0:
-                g["reached"] = True
-                last_event = (
-                    f"{g.get('emoji') or '👤'} {g.get('name') or 'A player'} "
-                    "reached the finish line."
-                )
-                rt["group_dirty"] = True
-                state_changed = True
-                _mark_dirty(rt, uid, URGENT)
-                _resolve_move(move, "🏁 You reached the finish!")
-            else:
-                _mark_dirty(rt, uid, MOVER)
-                _resolve_move(
-                    move, f"📍 {new_row} step{'s' if new_row != 1 else ''} to go"
-                )
+            moved, changed, event = _apply_one_move(rt, grid, move, grid_size)
+            touched = touched or moved
+            state_changed = state_changed or changed
+            if event:
+                last_event = event
 
         if touched:
             rt["state_version"] += 1
             rt["grid_version"] += 1
             rt["persist_dirty"] = True
-            # Everyone else sees the new grid, but only at their own (slow) interval.
-            for u, g in grid.items():
-                if _is_racing(g):
-                    _mark_dirty(rt, u, OTHER)
-                elif state_changed:
-                    _mark_dirty(rt, u, OTHER)
+
+            for uid, player in grid.items():
+                if _is_racing(player) or state_changed:
+                    _mark_dirty(rt, uid, OTHER)
 
             _merge_grid_into_match(snapshot, grid)
             if last_event:
                 snapshot.setdefault("game", {})["last_event"] = last_event
 
-            if not any(_is_racing(g) for g in grid.values()):
+            if not any(_is_racing(player) for player in grid.values()):
                 race_ended = True
-                qualifiers = [int(u) for u, g in grid.items() if g["alive"] and g["reached"]]
+                qualifiers = [
+                    int(uid) for uid, player in grid.items()
+                    if player["alive"] and player["reached"]
+                ]
 
     if race_ended:
         await _finish_round(context, mid, qualifiers)
@@ -973,20 +1040,49 @@ def _resolve_button_phase(rt, user_id, supplied_token):
 
 # ---------------------------------------------------------------- tap handler
 
-async def on_move(update, context):
-    query = update.callback_query
-    raw = query.data or ""
-    parts = raw.split(":")
-
+def _parse_move_callback(raw):
+    """Return (match_id, phase_token, direction), or None for malformed data."""
+    parts = (raw or "").split(":")
     if len(parts) == 4 and parts[0] == "rlgl":
-        _, mid, supplied_token, direction = parts
-    elif len(parts) == 3 and parts[0] == "rlgl":
+        _, mid, token, direction = parts
+        return mid, token, direction
+    if len(parts) == 3 and parts[0] == "rlgl":
         _, mid, direction = parts
-        supplied_token = None
-    else:
+        return mid, None, direction
+    return None
+
+
+def _move_rejection(rt, user_id):
+    """Return an explanatory rejection for a move that cannot enter the queue."""
+    if rt is None or rt.get("move_queue") is None:
+        return "This race is over.", False
+
+    if rt.get("done") or rt.get("round_finalizing"):
+        return "The round is finishing.", False
+
+    snapshot = rt.get("match_snapshot") or {}
+    if not (snapshot.get("game") or {}).get("started_at"):
+        return "Race hasn't started yet.", False
+
+    player = (rt.get("grid") or {}).get(_uid_key(user_id))
+    if player is None:
+        return "You are not in this race.", True
+    if not player["alive"]:
+        return "❌ You are eliminated.", False
+    if player["reached"]:
+        return "🏁 You already finished.", False
+    return None
+
+
+async def on_move(update, context):
+    """Validate a movement callback and queue it for the game tick."""
+    query = update.callback_query
+    parsed = _parse_move_callback(query.data)
+    if parsed is None:
         await safe_answer(query, "Invalid movement control.", True)
         return
 
+    mid, supplied_token, direction = parsed
     if direction in ("dead", "finished"):
         await safe_answer(query, "No controls available.")
         return
@@ -994,35 +1090,16 @@ async def on_move(update, context):
         await safe_answer(query, "Unknown movement.", True)
         return
 
-    # Look the runtime up without creating one for stale / foreign match ids.
+    # Read directly instead of creating runtime state for an old callback.
     rt = runtime._RUNTIME.get(mid)
-    if rt is None or rt.get("move_queue") is None:
-        await safe_answer(query, "This race is over.")
-        return
-    if rt.get("done") or rt.get("round_finalizing"):
-        await safe_answer(query, "The round is finishing.")
-        return
-    snapshot = rt.get("match_snapshot") or {}
-    if not (snapshot.get("game") or {}).get("started_at"):
-        await safe_answer(query, "Race hasn't started yet.")
+    rejection = _move_rejection(rt, query.from_user.id)
+    if rejection:
+        message, alert = rejection
+        await safe_answer(query, message, alert)
         return
 
     user_id = query.from_user.id
-    uid = str(user_id)
-
-    # Instant, queue-free answers for players who cannot move.
-    g = (rt.get("grid") or {}).get(uid)
-    if g is None:
-        await safe_answer(query, "You are not in this race.", True)
-        return
-    if not g["alive"]:
-        await safe_answer(query, "❌ You are eliminated.")
-        return
-    if g["reached"]:
-        await safe_answer(query, "🏁 You already finished.")
-        return
-
-    # Light per-player cooldown so spam-tapping cannot flood the tick.
+    uid = _uid_key(user_id)
     now = time.monotonic()
     last_moves = rt.setdefault("last_move_at", {})
     if now - last_moves.get(uid, 0.0) < MOVE_COOLDOWN:
@@ -1030,21 +1107,23 @@ async def on_move(update, context):
         return
     last_moves[uid] = now
 
-    fut = asyncio.get_running_loop().create_future()
+    future = asyncio.get_running_loop().create_future()
+    move = {
+        "uid": user_id,
+        "direction": direction,
+        "token": supplied_token,
+        "at": now,
+        "fut": future,
+    }
     try:
-        rt["move_queue"].put_nowait({
-            "uid": user_id,
-            "direction": direction,
-            "token": supplied_token,
-            "at": now,
-            "fut": fut,
-        })
+        rt["move_queue"].put_nowait(move)
     except asyncio.QueueFull:
         await safe_answer(query, "Too many moves — slow down.")
         return
 
     try:
-        text, alert = await asyncio.wait_for(fut, MOVE_ACK_TIMEOUT)
+        message, alert = await asyncio.wait_for(future, MOVE_ACK_TIMEOUT)
     except asyncio.TimeoutError:
-        text, alert = None, False
-    await safe_answer(query, text, alert)
+        message, alert = None, False
+    await safe_answer(query, message, alert)
+

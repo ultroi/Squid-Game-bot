@@ -144,18 +144,8 @@ async def edit_rich_message(
     return await bot._post("editMessageText", data=data)
 
 
-def _match_board_text(match):
-    players = match.get("players") or []
-    results = match.get("round_results") or {}
-    current_stage = match.get("current_round_stage")
-    current_participants = {
-        str(uid) for uid in match.get("current_round_player_ids", [])
-    }
-
-    game = match.get("game") or {}
-    game_states = game.get("players") or {}
-    status = match.get("stage")
-
+def _match_state_line(match):
+    """Describe the match's current lifecycle state for the scoreboard."""
     stage_titles = {
         "rlgl": "Red Light, Green Light",
         "dalgona": "Dalgona Candy",
@@ -164,25 +154,22 @@ def _match_board_text(match):
         "vote": "Elimination Vote",
         "final": "Squid Game Final",
     }
-    columns = ("rlgl", "dalgona", "marbles", "bridge", "vote", "final")
-    labels = ("RLGL", "DALG", "MARB", "BRDG", "VOTE", "FINL")
+    status = match.get("stage")
+    current_stage = match.get("current_round_stage")
 
     if status == "finished" and match.get("champion_id"):
         champion_id = str(match["champion_id"])
         champion = next(
             (
-                p for p in players
-                if str(p.get("id", p.get("user_id", ""))) == champion_id
+                player for player in (match.get("players") or [])
+                if str(player.get("id", player.get("user_id", ""))) == champion_id
             ),
             {},
         )
-        state_line = (
-            "🏆 CHAMPION · "
-            + html.escape(str(champion.get("name") or champion_id))
-        )
-    elif status == "finished":
-        state_line = "🏁 GAMES COMPLETE"
-    elif status == "intermission":
+        return "🏆 CHAMPION · " + html.escape(str(champion.get("name") or champion_id))
+    if status == "finished":
+        return "🏁 GAMES COMPLETE"
+    if status == "intermission":
         gate = match.get("next_round") or {}
         next_titles = {
             "rlgl": "Dalgona Candy",
@@ -194,104 +181,98 @@ def _match_board_text(match):
         }
         if gate.get("status") == "open":
             title = next_titles.get(gate.get("from_stage"), "Next Round")
-            state_line = "⏳ NEXT-ROUND ENTRY OPEN · UP NEXT: " + html.escape(title)
-        else:
-            state_line = "⏳ ROUND TRANSITION"
-    elif match.get("round_preparing"):
-        title = stage_titles.get(current_stage, "Next Round")
-        state_line = "⏳ PREPARING · " + html.escape(title)
-    elif current_stage:
-        title = stage_titles.get(current_stage, current_stage.upper())
-        state_line = "🎮 IN PROGRESS · " + html.escape(title)
-    else:
-        state_line = "🎮 MATCH IN PROGRESS"
+            return "⏳ NEXT-ROUND ENTRY OPEN · UP NEXT: " + html.escape(title)
+        return "⏳ ROUND TRANSITION"
+    if match.get("round_preparing"):
+        return "⏳ PREPARING · " + html.escape(stage_titles.get(current_stage, "Next Round"))
+    if current_stage:
+        return "🎮 IN PROGRESS · " + html.escape(
+            stage_titles.get(current_stage, current_stage.upper())
+        )
+    return "🎮 MATCH IN PROGRESS"
+
+
+def _player_round_cell(player, player_id, stage, current_stage, participants, results, preparing, game_state):
+    """Render one player's status cell for a single game stage."""
+    result = results.get(stage) or {}
+    qualified = {str(value) for value in result.get("qualified_ids", [])}
+    eliminated = {str(value) for value in result.get("eliminated_ids", [])}
+
+    if player_id in qualified:
+        return "✅"
+    if player_id in eliminated:
+        return "💀"
+    if stage != current_stage or (participants and player_id not in participants):
+        return "—"
+    if preparing:
+        return "⏳"
+    if not player.get("alive", True):
+        return "💀"
+    if stage == "rlgl" and player.get("reached"):
+        return "✅"
+    if stage == "dalgona" and game_state.get("done"):
+        return "✅"
+    return "🎮" if player.get("alive", True) else "—"
+
+
+def _match_player_row(index, player, columns, current_stage, participants, results, preparing, game_states):
+    player_id = str(player.get("id", player.get("user_id", "")))
+    name = str(
+        player.get("name") or player.get("display_name") or player_id or f"Player {index}"
+    ).replace("\n", " ").replace("\r", " ")
+    name = html.escape(name[:40])
+    game_state = game_states.get(player_id) or {}
+    cells = [
+        _player_round_cell(
+            player, player_id, stage, current_stage, participants,
+            results, preparing, game_state,
+        )
+        for stage in columns
+    ]
+    return (
+        "<tr>"
+        f'<td align="center">{index:02d}</td>'
+        f"<td>{name}</td>"
+        + "".join(f'<td align="center">{cell}</td>' for cell in cells)
+        + "</tr>"
+    )
+
+
+def _match_board_text(match):
+    players = match.get("players") or []
+    results = match.get("round_results") or {}
+    current_stage = match.get("current_round_stage")
+    participants = {str(uid) for uid in match.get("current_round_player_ids", [])}
+    game_states = (match.get("game") or {}).get("players") or {}
+    columns = ("rlgl", "dalgona", "marbles", "bridge", "vote", "final")
+    labels = ("RLGL", "DALG", "MARB", "BRDG", "VOTE", "FINL")
 
     total = len(players)
-    alive_count = sum(1 for p in players if p.get("alive", True))
+    alive_count = sum(1 for player in players if player.get("alive", True))
     eliminated_count = total - alive_count
-
     lines = [
         "<h2>🔺 SQUID GAME · MATCH BOARD</h2>",
-        f"<p>{state_line}</p>",
-        (
-            f"<p>👥 Total: <b>{total}</b>"
-            f" · 🟢 Alive: <b>{alive_count}</b>"
-            f" · 💀 Eliminated: <b>{eliminated_count}</b></p>"
-        ),
+        f"<p>{_match_state_line(match)}</p>",
+        f"<p>👥 Total: <b>{total}</b> · 🟢 Alive: <b>{alive_count}</b> · 💀 Eliminated: <b>{eliminated_count}</b></p>",
         "<h3>📊 PLAYER ROUND RESULTS</h3>",
-        "<table bordered striped compact>",
-        "<tr>"
-        "<th align=\"center\">NO</th>"
-        "<th>PLAYER</th>"
-        + "".join(f"<th align=\"center\">{label}</th>" for label in labels)
+        '<table bordered striped compact>',
+        '<tr><th align="center">NO</th><th>PLAYER</th>'
+        + "".join(f'<th align="center">{label}</th>' for label in labels)
         + "</tr>",
     ]
 
     for index, player in enumerate(players, 1):
-        uid = str(player.get("id", player.get("user_id", "")))
-        name = str(
-            player.get("name")
-            or player.get("display_name")
-            or uid
-            or f"Player {index}"
-        ).replace("\n", " ").replace("\r", " ")
-
-        name = html.escape(name[:40])
-        cells = []
-
-        player_game = game_states.get(uid) or {}
-
-        for col in columns:
-            result = results.get(col) or {}
-            qualified_ids = {
-                str(value) for value in result.get("qualified_ids", [])
-            }
-            eliminated_ids = {
-                str(value) for value in result.get("eliminated_ids", [])
-            }
-
-            if uid in qualified_ids:
-                cell = "✅"
-            elif uid in eliminated_ids:
-                cell = "💀"
-            elif col == current_stage and (
-                not current_participants or uid in current_participants
-            ):
-                if match.get("round_preparing"):
-                    cell = "⏳"
-                elif not player.get("alive", True):
-                    cell = "💀"
-                elif col == "rlgl" and player.get("reached"):
-                    cell = "✅"
-                elif col == "dalgona" and player_game.get("done"):
-                    cell = "✅"
-                elif player.get("alive", True):
-                    cell = "🎮"
-                else:
-                    cell = "—"
-            else:
-                cell = "—"
-
-            cells.append(cell)
-
         lines.append(
-            "<tr>"
-            f"<td align=\"center\">{index:02d}</td>"
-            f"<td>{name}</td>"
-            + "".join(f"<td align=\"center\">{cell}</td>" for cell in cells)
-            + "</tr>"
+            _match_player_row(
+                index, player, columns, current_stage, participants, results,
+                bool(match.get("round_preparing")), game_states,
+            )
         )
-
     if not players:
-        lines.append(
-            '<tr><td colspan="8">No registered players yet.</td></tr>'
-        )
-
-    lines.extend([
-        "</table>",
-    ])
-
+        lines.append('<tr><td colspan="8">No registered players yet.</td></tr>')
+    lines.extend(["</table>"])
     return "\n".join(lines)
+
 
 
 
@@ -357,63 +338,78 @@ def render_lobby(match, seconds_left=None, min_players=None, max_players=None):
     return "\n".join(lines)
 
 
+def _round_result_block(match, stage):
+    """Build the qualified/eliminated summary shown when a round ends."""
+    players = match.get("players") or []
+    if stage == "rlgl":
+        qualified = [
+            html.escape(str(player.get("name") or player.get("id")))
+            for player in players if player.get("reached")
+        ]
+        eliminated = [
+            html.escape(str(player.get("name") or player.get("id")))
+            for player in players
+            if not player.get("alive") and not player.get("reached")
+        ]
+    else:
+        qualified = [
+            html.escape(str(player.get("name") or player.get("id")))
+            for player in players if player.get("alive")
+        ]
+        eliminated = [
+            html.escape(str(player.get("name") or player.get("id")))
+            for player in players if not player.get("alive")
+        ]
+
+    qualified_text = ", ".join(qualified) if qualified else "None"
+    eliminated_text = ", ".join(eliminated) if eliminated else "None"
+    return (
+        f"\n\n📊 <b>RESULTS</b>\n"
+        f"✅ <b>Qualified ({len(qualified)}):</b> {qualified_text}\n"
+        f"💀 <b>Eliminated ({len(eliminated)}):</b> {eliminated_text}"
+    )
+
+
 def round_status_text(match, stage, details=None, event=None, finished=False):
     round_number, title, description = ROUND_INFO.get(
         stage, (0, str(stage).replace("_", " ").upper(), "Follow the instructions below.")
     )
     alive_count, qualified, eliminated, total = _match_counts(match, stage)
-    heading = f"🦑 <b>SQUID GAME · ROUND {round_number}</b>" if round_number else "🦑 <b>SQUID GAME</b>"
-    
-    # Status Line Set karein
+    heading = (
+        f"🦑 <b>SQUID GAME · ROUND {round_number}</b>"
+        if round_number else "🦑 <b>SQUID GAME</b>"
+    )
+
     if finished:
         status_line = "🏁 <b>ROUND COMPLETE</b>"
     elif match.get("round_preparing"):
         status_line = "⏳ <b>PREPARING · CONTROLS OPEN SOON</b>"
     else:
         status_line = "🟢 <b>IN PROGRESS</b>"
-        
-    # Stats Line Set karein
+
     if stage == "rlgl":
         stats_line = f"🏃 {alive_count} racing  ·  🏁 {qualified} finished  ·  💀 {eliminated} out"
     else:
         stats_line = f"👥 {alive_count} alive  ·  💀 {eliminated} out  ·  {total} total"
-        
-    # Optional Blocks
+
     details_block = f"\n\n{details}" if details else ""
-    event_block = f"\n\n📣 <b>Update:</b> {html.escape(str(event)[:140])}" if event and not finished else ""
-    
-    # Results Block Set karein
-    results_block = ""
-    if finished:
-        players = match.get("players", [])
-        if stage == "rlgl":
-            qualifiers = [html.escape(p.get("name") or str(p.get("id"))) for p in players if p.get("reached")]
-            eliminated_players = [html.escape(p.get("name") or str(p.get("id"))) for p in players if not p.get("alive") and not p.get("reached")]
-        else:
-            qualifiers = [html.escape(p.get("name") or str(p.get("id"))) for p in players if p.get("alive")]
-            eliminated_players = [html.escape(p.get("name") or str(p.get("id"))) for p in players if not p.get("alive")]
+    event_block = (
+        f"\n\n📣 <b>Update:</b> {html.escape(str(event)[:140])}"
+        if event and not finished else ""
+    )
+    results_block = _round_result_block(match, stage) if finished else ""
 
-        q_str = ", ".join(qualifiers) if qualifiers else "None"
-        e_str = ", ".join(eliminated_players) if eliminated_players else "None"
-        
-        results_block = (
-            f"\n\n📊 <b>RESULTS</b>\n"
-            f"✅ <b>Qualified ({len(qualifiers)}):</b> {q_str}\n"
-            f"💀 <b>Eliminated ({len(eliminated_players)}):</b> {e_str}"
-        )
-
-    # --- EASY TO EDIT UI FORMAT ---
     return (
         f"{heading}\n"
         f"<b>{html.escape(title)}</b>\n"
-        f"<i>{html.escape(description)}</i>\n"
-        f"\n"
+        f"<i>{html.escape(description)}</i>\n\n"
         f"{status_line}\n"
         f"{stats_line}"
         f"{details_block}"
         f"{event_block}"
         f"{results_block}"
     )
+
 
 
 def next_round_keyboard(match_id):
@@ -817,6 +813,92 @@ def rlgl_image_url(light):
     return _validate_rich_image_url(source)
  
  
+def _rlgl_signal_text(light, round_finished, seconds_left):
+    green = str(light or "green").lower() == "green"
+    if round_finished:
+        return (
+            "🏁 ROUND FINISHED",
+            "This round has ended. Final positions and standings are shown below.",
+            '<p>⏹ <b>Round status:</b> <code>FINISHED</code></p>',
+        )
+
+    signal = "🟢 GREEN LIGHT — MOVE" if green else "🔴 RED LIGHT — FREEZE"
+    instruction = (
+        "The doll is turned away. Move toward the finish."
+        if green else "The doll is watching. Freeze now; moving will eliminate you."
+    )
+    timer = (
+        f'<p>⏱ <b>Time left:</b> <code>~{max(0, int(seconds_left))}s</code></p>'
+        if seconds_left is not None else ""
+    )
+    return signal, instruction, timer
+
+
+def _rlgl_terminal_message(viewer):
+    if viewer and viewer.get("reached"):
+        return (
+            '<blockquote>🏁 <b>YOU HAVE QUALIFIED</b>\n'
+            "You reached the finish. Wait for the next round.</blockquote>"
+        )
+    if viewer and not viewer.get("alive", True):
+        return (
+            '<blockquote>❌ <b>YOU ARE ELIMINATED</b>\n'
+            "Movement controls are disabled.</blockquote>"
+        )
+    return ""
+
+
+def _rlgl_controls(match_id, phase_token, round_finished, viewer, green):
+    if match_id is None:
+        return ""
+
+    safe_match_id = html.escape(str(match_id), quote=True)
+    safe_phase = html.escape(str(phase_token if phase_token is not None else "0"), quote=True)
+    if round_finished:
+        style, data, label = "primary", "finished", "🏁 ROUND FINISHED · WAIT"
+        return (
+            '<tg-button-row align="center">'
+            f'<tg-button type="callback_data" style="{style}" '
+            f'data="rlgl:{safe_match_id}:{safe_phase}:{data}">{label}</tg-button>'
+            '</tg-button-row>'
+        )
+    if viewer and viewer.get("reached"):
+        return (
+            '<tg-button-row align="center">'
+            f'<tg-button type="callback_data" style="success" '
+            f'data="rlgl:{safe_match_id}:{safe_phase}:finished">🏁 QUALIFIED · WAIT</tg-button>'
+            '</tg-button-row>'
+        )
+    if viewer and not viewer.get("alive", True):
+        return (
+            '<tg-button-row align="center">'
+            f'<tg-button type="callback_data" style="danger" '
+            f'data="rlgl:{safe_match_id}:{safe_phase}:dead">❌ ELIMINATED · NO CONTROLS</tg-button>'
+            '</tg-button-row>'
+        )
+
+    forward_style = "success" if green else "danger"
+    return (
+        '<tg-button-row align="center">'
+        f'<tg-button type="callback_data" style="{forward_style}" '
+        f'data="rlgl:{safe_match_id}:{safe_phase}:up">⬆️ MOVE FORWARD</tg-button>'
+        '</tg-button-row>'
+        '<tg-button-row align="center">'
+        f'<tg-button type="callback_data" style="primary" '
+        f'data="rlgl:{safe_match_id}:{safe_phase}:left">⬅️ LEFT</tg-button>'
+        f'<tg-button type="callback_data" style="primary" '
+        f'data="rlgl:{safe_match_id}:{safe_phase}:right">RIGHT ➡️</tg-button>'
+        '</tg-button-row>'
+    )
+
+
+def _rlgl_selected_image(light, image_url):
+    try:
+        return _validate_rich_image_url(image_url) if image_url else rlgl_image_url(light)
+    except ValueError:
+        return rlgl_image_url(light)
+
+
 def rlgl_dm_html(
     match,
     viewer_id,
@@ -828,82 +910,27 @@ def rlgl_dm_html(
     image_url=None,
     ctx=None,
 ):
-    players = match.get("players", [])
+    """Render the private RLGL card from match state and a shared render context."""
+    players = match.get("players") or []
     if ctx is None:
         ctx = rlgl_render_context(match, light)
+
     game_data = match.get("game") or {}
     round_finished = bool(round_finished or game_data.get("round_finished"))
     green = str(light or "green").lower() == "green"
- 
-    if round_finished:
-        signal = '🏁 ROUND FINISHED'
-        instruction = 'This round has ended. Final positions and standings are shown below.'
-        timer_line = '<p>⏹ <b>Round status:</b> <code>FINISHED</code></p>'
-    else:
-        signal = '🟢 GREEN LIGHT — MOVE' if green else '🔴 RED LIGHT — FREEZE'
-        instruction = (
-            'The doll is turned away. Move toward the finish.'
-            if green else
-            'The doll is watching. Freeze now; moving will eliminate you.'
-        )
-        timer_line = (
-            f'<p>⏱ <b>Time left:</b> <code>~{max(0, int(seconds_left))}s</code></p>'
-            if seconds_left is not None else ''
-        )
- 
-    viewer = next((p for p in players if str(p.get("id")) == str(viewer_id)), None)
-    if viewer and viewer.get("reached"):
-        terminal = '<blockquote>🏁 <b>YOU HAVE QUALIFIED</b>\nYou reached the finish. Wait for the next round.</blockquote>'
-    elif viewer and not viewer.get("alive", True):
-        terminal = '<blockquote>❌ <b>YOU ARE ELIMINATED</b>\nMovement controls are disabled.</blockquote>'
-    else:
-        terminal = ''
- 
+    signal, instruction, timer_line = _rlgl_signal_text(light, round_finished, seconds_left)
+
+    viewer = next(
+        (player for player in players if str(player.get("id")) == str(viewer_id)),
+        None,
+    )
+    terminal = _rlgl_terminal_message(viewer)
     alive_count, finished_count, out_count = ctx["counts"]
- 
-    controls = ''
-    if match_id is not None:
-        safe_mid = html.escape(str(match_id), quote=True)
-        safe_phase = html.escape(str(phase_token if phase_token is not None else "0"), quote=True)
-        if round_finished:
-            controls = (
-                '<tg-button-row align="center">'
-                f'<tg-button type="callback_data" style="primary" data="rlgl:{safe_mid}:{safe_phase}:finished">🏁 ROUND FINISHED · WAIT</tg-button>'
-                '</tg-button-row>'
-            )
-        elif viewer and viewer.get("reached"):
-            controls = (
-                '<tg-button-row align="center">'
-                f'<tg-button type="callback_data" style="success" data="rlgl:{safe_mid}:{safe_phase}:finished">🏁 QUALIFIED · WAIT</tg-button>'
-                '</tg-button-row>'
-            )
-        elif viewer and not viewer.get("alive", True):
-            controls = (
-                '<tg-button-row align="center">'
-                f'<tg-button type="callback_data" style="danger" data="rlgl:{safe_mid}:{safe_phase}:dead">❌ ELIMINATED · NO CONTROLS</tg-button>'
-                '</tg-button-row>'
-            )
-        else:
-            forward_style = 'success' if green else 'danger'
-            controls = (
-                '<tg-button-row align="center">'
-                f'<tg-button type="callback_data" style="{forward_style}" data="rlgl:{safe_mid}:{safe_phase}:up">⬆️ MOVE FORWARD</tg-button>'
-                '</tg-button-row>'
-                '<tg-button-row align="center">'
-                f'<tg-button type="callback_data" style="primary" data="rlgl:{safe_mid}:{safe_phase}:left">⬅️ LEFT</tg-button>'
-                f'<tg-button type="callback_data" style="primary" data="rlgl:{safe_mid}:{safe_phase}:right">RIGHT ➡️</tg-button>'
-                '</tg-button-row>'
-            )
- 
-    try:
-        # Keep the source URL intact: Telegram renders this as a photo block
-        # in the same rich message as the formatted game text and controls.
-        chosen_image_url = (
-            _validate_rich_image_url(image_url) if image_url else rlgl_image_url(light)
-        )
-    except ValueError:
-        chosen_image_url = rlgl_image_url(light)
- 
+    controls = _rlgl_controls(
+        match_id, phase_token, round_finished, viewer, green,
+    )
+    chosen_image_url = _rlgl_selected_image(light, image_url)
+
     parts = [
         f'<img src="{html.escape(chosen_image_url, quote=True)}"/>',
         '<blockquote>'
@@ -923,7 +950,8 @@ def rlgl_dm_html(
         _rlgl_standings(ctx, viewer_id),
         controls,
     ]
-    return ''.join(part for part in parts if part)
+    return "".join(part for part in parts if part)
+
  
  
 async def send_rlgl_rich_message(bot, chat_id, rich_html, *, media=None):
