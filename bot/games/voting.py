@@ -69,7 +69,7 @@ async def begin(context, mid):
 async def _run_round(context, mid):
     """30s prep then send voting DMs and start timeout."""
     try:
-        for delay, shown in [(10, 20), (10, 10), (5, 5)]:
+        for delay, shown in [(5, 10), (5, 5)]:
             await asyncio.sleep(delay)
             latest = await get_match(mid)
             if not latest or latest.get("stage") != "vote":
@@ -83,17 +83,21 @@ async def _run_round(context, mid):
         latest = await get_match(mid)
         if not latest or latest.get("stage") != "vote":
             return
-        for player in alive(latest):
+        async def _send_vote_dm(player):
             try:
                 message = await context.bot.send_message(
-                    player["id"],
-                    "🗳 <b>Vote to eliminate one player:</b>",
+                    chat_id=player["id"],
+                    text="🗳 <b>Vote to eliminate one player:</b>",
                     reply_markup=ui.vote_keyboard(latest, mid, player["id"]),
                     parse_mode="HTML",
                 )
                 player["dm_mid"] = message.message_id
             except Exception:
+                # Voting can continue for other players when one DM cannot be sent.
                 pass
+
+        # Keep all message IDs before saving, but send to players concurrently.
+        await asyncio.gather(*(_send_vote_dm(player) for player in alive(latest)))
         await save_match(latest)
         await _refresh(context, mid)
         runtime.add_task(mid, asyncio.create_task(_timeout(context, mid)))

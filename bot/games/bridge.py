@@ -44,7 +44,7 @@ async def begin(context, mid):
 async def _run_round(context, mid):
     """30s prep then start bridge."""
     try:
-        for delay, shown in [(10, 20), (10, 10), (5, 5)]:
+        for delay, shown in [ (5, 10), (5, 5)]:
             await asyncio.sleep(delay)
             latest = await get_match(mid)
             if not latest or latest.get("stage") != "bridge":
@@ -115,7 +115,8 @@ async def _refresh(context, mid, event=None, finished=False):
         context.bot, match, "bridge", details=details,
         event=g.get("last_event"), finished=finished,
     )
-    await refresh_lobby_scoreboard(context, mid)
+    if finished:
+        await refresh_lobby_scoreboard(context, mid, force=True)
 
 
 async def _prompt(context, mid):

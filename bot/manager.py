@@ -11,6 +11,17 @@ from .repository import get_match, save_match, alive, get_player, add_win, recor
 
 log = logging.getLogger(__name__)
 
+# Keep fire-and-forget notification tasks strongly referenced until they finish.
+_background_tasks = set()
+
+
+def _spawn_background_task(coro, *, name=None):
+    """Schedule work without blocking the game flow and retain its task reference."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 # ---------- messaging helpers ----------
 
@@ -434,29 +445,41 @@ async def game_finished(context, mid, survivor_ids, title):
     await save_match(match)
     await refresh_lobby_scoreboard(context, mid, force=True)
 
-    # Private result notices are useful; the group still uses one consolidated card.
-    for player in newly_eliminated:
-        try:
-            await context.bot.send_message(
-                player["id"],
-                f"💀 <b>{html.escape(title)}</b> — you were eliminated.",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+    # Send result DMs concurrently in the background. Crown/gate handling must not
+    # wait for private Telegram API requests to complete.
+    if newly_eliminated or len(survivors) > 1:
+        async def _send_result_dms():
+            async def _send_dm(uid, message_text):
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=message_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    # A failed private notice must not interrupt the match flow.
+                    log.debug("Could not send round-result DM to user %s", uid, exc_info=True)
 
-    if len(survivors) > 1:
-        for player in survivors:
-            try:
-                await context.bot.send_message(
+            dm_tasks = [
+                _send_dm(
                     player["id"],
-                    f"✅ You qualified <b>{html.escape(title)}</b>. "
-                    "Return to the group and tap ENTER NEXT ROUND before the timer expires.",
-                    parse_mode=ParseMode.HTML,
+                    f"💀 <b>{html.escape(title)}</b> — you were eliminated.",
                 )
-            except Exception:
-                # They can still attempt to enter from the group even if this notice fails.
-                pass
+                for player in newly_eliminated
+            ]
+            if len(survivors) > 1:
+                dm_tasks.extend(
+                    _send_dm(
+                        player["id"],
+                        f"✅ You qualified <b>{html.escape(title)}</b>. "
+                        "Return to the group and tap ENTER NEXT ROUND before the timer expires.",
+                    )
+                    for player in survivors
+                )
+            if dm_tasks:
+                await asyncio.gather(*dm_tasks, return_exceptions=True)
+
+        _spawn_background_task(_send_result_dms(), name=f"round-result-dms:{mid}")
 
     if not survivors:
         match["stage"] = "finished"

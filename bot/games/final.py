@@ -146,7 +146,8 @@ async def _refresh_group(context, mid, event=None, finished=False):
         context.bot, match, "final", details=_final_details(match),
         event=game.get("last_event"), finished=finished,
     )
-    await refresh_lobby_scoreboard(context, mid)
+    if finished:
+        await refresh_lobby_scoreboard(context, mid, force=True)
 
 
 async def begin(context, mid):
@@ -178,7 +179,7 @@ async def begin(context, mid):
 async def _run_round(context, mid):
     """30s prep then start the first bracket."""
     try:
-        for delay, shown in [(10, 20), (10, 10), (5, 5)]:
+        for delay, shown in [ (5, 10), (5, 5)]:
             await asyncio.sleep(delay)
             latest = await get_match(mid)
             if not latest or latest.get("stage") != "final":

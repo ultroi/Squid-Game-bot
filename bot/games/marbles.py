@@ -86,8 +86,9 @@ async def _refresh_group(context, mid, event=None, finished=False, seconds_left=
         context.bot, match, "marbles", details=_group_details(match, seconds_left),
         event=game.get("last_event"), finished=finished,
     )
-    from ..manager import refresh_lobby_scoreboard
-    await refresh_lobby_scoreboard(context, mid)
+    if finished:
+        from ..manager import refresh_lobby_scoreboard
+        await refresh_lobby_scoreboard(context, mid, force=True)
 
 
 async def begin(context, mid):
@@ -105,20 +106,24 @@ async def begin(context, mid):
         bye = ids.pop()
     match["game"] = {"pairs": pairs, "bye": bye, "last_event": None, "round_finished": False}
 
-    for p in players:
+    async def _send_preparation_dm(player):
+        text = "🎱 <b>Marbles is preparing!</b>\n\nWait for the group countdown to finish..."
+        if bye and player["id"] == bye:
+            text = "🎟 <b>You received a BYE!</b>\n\nYou automatically advance to the next round. Please wait for others to finish."
         try:
-            text = "🎱 <b>Marbles is preparing!</b>\n\nWait for the group countdown to finish..."
-            if bye and p["id"] == bye:
-                text = "🎟 <b>You received a BYE!</b>\n\nYou automatically advance to the next round. Please wait for others to finish."
-            
-            msg = await context.bot.send_message(
-                chat_id=p["id"],
+            message = await context.bot.send_message(
+                chat_id=player["id"],
                 text=text,
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
-            p["dm_mid"] = msg.message_id
+            player["dm_mid"] = message.message_id
         except Exception:
-            p["alive"] = False
+            # Preserve the existing rule: players we cannot DM are removed.
+            player["alive"] = False
+
+    # Concurrent sends reduce the preparation delay from the sum of request times
+    # to approximately the slowest individual request. Save after IDs are assigned.
+    await asyncio.gather(*(_send_preparation_dm(player) for player in players))
     # --------------------------------
 
     await ui.send_round_announcement(
@@ -132,7 +137,7 @@ async def begin(context, mid):
 
 async def _run_round(context, mid):
     try:
-        for delay, shown in [(10, 20), (10, 10), (5, 5)]:
+        for delay, shown in [(5, 10), (5, 5)]:
             await asyncio.sleep(delay)
             latest = await get_match(mid)
             if not latest or latest.get("stage") != "marbles":

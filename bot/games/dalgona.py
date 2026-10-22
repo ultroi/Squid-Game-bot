@@ -74,12 +74,6 @@ def _group_details(match: dict, seconds_left: int=None) -> str:
 
 
 async def _refresh_group(context, mid: str, event: str | None=None, finished: bool=False, seconds_left: int=None) -> None:
-    """Refresh the round card at meaningful checkpoints, not on every flash.
-
-    The flashing board is already a separate group message. Editing both the
-    round card and the match scoreboard for every phase needlessly increases
-    group API traffic, so the scoreboard is refreshed only for results/final.
-    """
     match = await get_match(mid)
     if not match or match.get('stage') != 'dalgona':
         return
@@ -352,13 +346,11 @@ async def _run_game(context, mid: str) -> None:
                 await save_match(match)
             survivors = [player for player in match.get('players', []) if player.get('alive', True)]
             result_str = f'<b>{emoji} {shape_name} Results:</b>\n✅ {len(survivors)} Survived\n💀 {timed_out_count} Eliminated'
+            
             await _delete_previous_dm_prompt(context, mid)
-            await _refresh_group(context, mid, event=result_str, finished=True)
-            await asyncio.sleep(2.0)
-
             
             survivor_ids = [player["id"] for player in survivors if player.get("id") is not None]
-            await _finish(context, mid, survivor_ids)
+            await _finish(context, mid, survivor_ids, event=result_str)
             return
     except asyncio.CancelledError:
         raise
@@ -442,7 +434,7 @@ async def on_press(update, context) -> None:
             event.set()
 
 
-async def _finish(context, mid: str, survivors: list[int]) -> None:
+async def _finish(context, mid: str, survivors: list[int], event: str | None = None) -> None:
     """Finalize Dalgona, publish results, and continue the manager lifecycle."""
     await _delete_previous_dm_prompt(context, mid)
     match = await get_match(mid)
@@ -450,6 +442,8 @@ async def _finish(context, mid: str, survivors: list[int]) -> None:
         return
     game = match.setdefault('game', {})
     game['round_finished'] = True
+    if event:
+        game['last_event'] = event
     existing_entrants = {str(uid) for uid in match.get('current_round_player_ids') or []}
     if not existing_entrants:
         state_players = game.get('players') or {}
@@ -459,7 +453,12 @@ async def _finish(context, mid: str, survivors: list[int]) -> None:
             match['current_round_player_ids'] = entrants
     await save_match(match)
     try:
-        await ui.refresh_round_announcement(context.bot, match, 'dalgona', finished=True)
+        await ui.refresh_round_announcement(
+            context.bot, match, 'dalgona', 
+            details=_group_details(match), 
+            event=game.get('last_event'), 
+            finished=True
+        )
     except Exception:
         log.exception('Could not edit Dalgona round announcement (match=%s)', mid)
     await game_finished(context, mid, survivors, 'Dalgona Candy')
