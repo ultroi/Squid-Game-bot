@@ -4,17 +4,16 @@ import asyncio
 import logging
 import random
 import time
-import html
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from .. import runtime, ui
 from ..manager import safe_answer, safe_edit, game_finished, refresh_lobby_scoreboard
 from ..repository import get_match, save_match, alive, update_dalgona_tap
 log = logging.getLogger(__name__)
 GROUP_SHAPES = [
-    ("Circle", 4, "⭕"),
-    ("Triangle", 6, "🔺"),
-    ("Star", 8, "⭐"),
-    ("Umbrella", 10, "☂️"),
+    ("Circle", 3, "⭕"),
+    ("Triangle", 4, "🔺"),
+    ("Star", 5, "⭐"),
+    ("Umbrella", 6, "☂️"),
 ]
 FLASH_SECONDS = 1
 DM_READY_SECONDS = 5
@@ -207,7 +206,7 @@ async def _run_game(context, mid: str) -> None:
     pending_pattern: tuple[int, list[int]] | None = None
     flash_restarts: dict[int, int] = {}
     try:
-        checkpoints = [30, 20, 10, 5]
+        checkpoints = [15, 10, 5]
         for index, remaining in enumerate(checkpoints):
             await _refresh_group(context, mid, seconds_left=remaining)
             next_remaining = checkpoints[index + 1] if index + 1 < len(checkpoints) else 0
@@ -357,8 +356,7 @@ async def _run_game(context, mid: str) -> None:
             await _refresh_group(context, mid, event=result_str, finished=True)
             await asyncio.sleep(2.0)
 
-            # Dalgona is a single-shape game: publish this round's results,
-            # then finish the game and pass the survivors to the match manager.
+            
             survivor_ids = [player["id"] for player in survivors if player.get("id") is not None]
             await _finish(context, mid, survivor_ids)
             return
@@ -444,55 +442,6 @@ async def on_press(update, context) -> None:
             event.set()
 
 
-async def _send_final_group_result(context, match: dict, survivors: list[int]) -> bool:
-    """Send a standalone Dalgona result, even if nobody qualifies.
-
-    This message does not depend on editing the image-backed Rich Message.
-    """
-    game = match.setdefault('game', {})
-    if game.get('final_group_result_message_id'):
-        return True
-    players = match.get('players', [])
-    survivor_ids = {str(uid) for uid in survivors or []}
-    game_players = game.get('players') or {}
-    participant_ids = {str(uid) for uid in game_players.keys()} if isinstance(game_players, dict) else set()
-    if not participant_ids:
-        participant_ids = {str(uid) for uid in match.get('current_round_player_ids') or []}
-    if not participant_ids:
-        participant_ids = {str(player.get('id')) for player in players if player.get('id') is not None}
-    qualified_players = [player for player in players if str(player.get('id')) in survivor_ids and str(player.get('id')) in participant_ids and player.get('alive', True)]
-    qualified_ids = {str(player.get('id')) for player in qualified_players}
-    eliminated_players = [player for player in players if str(player.get('id')) in participant_ids and str(player.get('id')) not in qualified_ids]
-    qualified_names = ', '.join((html.escape(str(player.get('name') or player.get('id'))) for player in qualified_players)) or 'None'
-    eliminated_names = ', '.join((html.escape(str(player.get('name') or player.get('id'))) for player in eliminated_players)) or 'None'
-    lines = ['🍪 <b>DALGONA CANDY - Result</b>', '', f'✅ <b>Qualified ({len(qualified_players)}):</b> {qualified_names}', f'💀 <b>Eliminated ({len(eliminated_players)}):</b> {eliminated_names}']
-    if not qualified_players:
-        lines.extend(['', '❌ <b>No one qualified.</b>', 'The match is over.'])
-    else:
-        lines.extend(['', '➡️ Qualified players can enter the next round from the group message.'])
-    for attempt in range(3):
-        try:
-            message = await context.bot.send_message(chat_id=match['chat_id'], text='\n'.join(lines), parse_mode='HTML', disable_web_page_preview=True)
-            game['final_group_result_message_id'] = message.message_id
-            await save_match(match)
-            return True
-        except RetryAfter as exc:
-            delay = getattr(exc, 'retry_after', 1)
-            if hasattr(delay, 'total_seconds'):
-                delay = delay.total_seconds()
-            if attempt < 2:
-                await asyncio.sleep(max(0.0, float(delay)) + 0.2)
-                continue
-            log.error('Dalgona final result send was rate-limited repeatedly (match=%s)', match.get('_id'))
-        except TelegramError:
-            log.exception('Could not send Dalgona final group result (match=%s)', match.get('_id'))
-            break
-        except Exception:
-            log.exception('Unexpected error sending Dalgona final group result (match=%s)', match.get('_id'))
-            break
-    return False
-
-
 async def _finish(context, mid: str, survivors: list[int]) -> None:
     """Finalize Dalgona, publish results, and continue the manager lifecycle."""
     await _delete_previous_dm_prompt(context, mid)
@@ -513,7 +462,4 @@ async def _finish(context, mid: str, survivors: list[int]) -> None:
         await ui.refresh_round_announcement(context.bot, match, 'dalgona', finished=True)
     except Exception:
         log.exception('Could not edit Dalgona round announcement (match=%s)', mid)
-    latest = await get_match(mid)
-    if latest and latest.get('stage') == 'dalgona':
-        await _send_final_group_result(context, latest, survivors)
     await game_finished(context, mid, survivors, 'Dalgona Candy')

@@ -104,6 +104,23 @@ async def begin(context, mid):
     if ids:
         bye = ids.pop()
     match["game"] = {"pairs": pairs, "bye": bye, "last_event": None, "round_finished": False}
+
+    for p in players:
+        try:
+            text = "🎱 <b>Marbles is preparing!</b>\n\nWait for the group countdown to finish..."
+            if bye and p["id"] == bye:
+                text = "🎟 <b>You received a BYE!</b>\n\nYou automatically advance to the next round. Please wait for others to finish."
+            
+            msg = await context.bot.send_message(
+                chat_id=p["id"],
+                text=text,
+                parse_mode="HTML"
+            )
+            p["dm_mid"] = msg.message_id
+        except Exception:
+            p["alive"] = False
+    # --------------------------------
+
     await ui.send_round_announcement(
         context.bot, match, "marbles",
         details=_group_details(match, PREPARATION_SECONDS),

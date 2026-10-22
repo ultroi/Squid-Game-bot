@@ -446,7 +446,7 @@ def round_result_text(match, stage, event=None):
     ]
 
     if event:
-        lines.extend(["", f"📣 <i>{html.escape(str(event))}</i>"])
+        lines.extend(["", f"📣 <i>{str(event)}</i>"])
 
     if not qualified:
         lines.extend(["", "❌ <b>No one qualified.</b> The match is over."])
@@ -974,12 +974,6 @@ def _rlgl_controls(match_id, phase_token, round_finished, viewer, green):
         '<tg-button-row align="center">'
         f'<tg-button type="callback_data" style="{forward_style}" '
         f'data="rlgl:{safe_match_id}:{safe_phase}:up">⬆️ MOVE FORWARD</tg-button>'
-        '</tg-button-row>'
-        '<tg-button-row align="center">'
-        f'<tg-button type="callback_data" style="primary" '
-        f'data="rlgl:{safe_match_id}:{safe_phase}:left">⬅️ LEFT</tg-button>'
-        f'<tg-button type="callback_data" style="primary" '
-        f'data="rlgl:{safe_match_id}:{safe_phase}:right">RIGHT ➡️</tg-button>'
         '</tg-button-row>'
     )
 

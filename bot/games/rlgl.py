@@ -550,10 +550,6 @@ def _apply_one_move(rt, grid, move, grid_size):
     row, col = player["pos"]
     if move["direction"] == "up":
         new_row, new_col = max(0, row - 1), col
-    elif move["direction"] == "left":
-        new_row, new_col = row, max(0, col - 1)
-    else:
-        new_row, new_col = row, min(grid_size - 1, col + 1)
 
     if (new_row, new_col) == (row, col):
         _resolve_move(move, "⛔ Edge of the track.")
@@ -1093,7 +1089,7 @@ async def on_move(update, context):
     if direction in ("dead", "finished"):
         await safe_answer(query, "No controls available.")
         return
-    if direction not in {"up", "left", "right"}:
+    if direction not in {"up"}:
         await safe_answer(query, "Unknown movement.", True)
         return
 
