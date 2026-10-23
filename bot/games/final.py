@@ -5,7 +5,10 @@ import logging
 import random
 
 from .. import config, runtime, ui
-from ..manager import safe_edit, safe_answer, crown, open_final_bracket_gate, refresh_lobby_scoreboard
+from ..manager import (
+    safe_edit, safe_answer, crown, open_final_bracket_gate, refresh_lobby_scoreboard,
+    _spawn_background_task,
+)
 from ..repository import get_match, save_match, alive, get_player, pname
 
 log = logging.getLogger(__name__)
@@ -74,16 +77,18 @@ async def _bracket_timeout(context, mid, bracket_round_idx):
                     loser_player["alive"] = False
                     dm_mid = loser_player.get("dm_mid")
                     if dm_mid:
-                        asyncio.create_task(
-                            safe_edit(context.bot, int(loser_uid), dm_mid, "💀 <b>TIME OUT!</b> You failed to act and were eliminated.", reply_markup=ui.kb([]))
+                        _spawn_background_task(
+                            safe_edit(context.bot, int(loser_uid), dm_mid, "💀 <b>TIME OUT!</b> You failed to act and were eliminated.", reply_markup=ui.kb([])),
+                            name=f"final-timeout-loser:{mid}:{loser_uid}",
                         )
 
                 winner_player = get_player(match, int(winner_uid))
                 if winner_player:
                     dm_mid = winner_player.get("dm_mid")
                     if dm_mid:
-                        asyncio.create_task(
-                            safe_edit(context.bot, int(winner_uid), dm_mid, "⏳ <b>Opponent timed out.</b> You advance by default.", reply_markup=ui.kb([]))
+                        _spawn_background_task(
+                            safe_edit(context.bot, int(winner_uid), dm_mid, "⏳ <b>Opponent timed out.</b> You advance by default.", reply_markup=ui.kb([])),
+                            name=f"final-timeout-winner:{mid}:{winner_uid}",
                         )
 
         if incomplete_duels:
@@ -415,6 +420,13 @@ async def _resolve_exchange(context, mid, idx):
 
 
 async def _advance_bracket(context, mid):
+    """Advance a bracket exactly once despite simultaneous duel callbacks."""
+    rt = runtime.get(str(mid))
+    async with rt.setdefault("bracket_advance_lock", asyncio.Lock()):
+        await _advance_bracket_once(context, mid)
+
+
+async def _advance_bracket_once(context, mid):
     rt = runtime.get(mid)
     is_champion = False
     champion_id = None

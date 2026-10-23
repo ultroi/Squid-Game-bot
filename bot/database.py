@@ -25,11 +25,16 @@ matches = db["matches"]
 welcome_assets = db["welcome_assets"]
 bot_stats = db["bot_stats"]
 groups = db["groups"]
+match_history = db["match_history"]
 
 async def ensure_indexes() -> None:
     await users.create_index(
         [("telegram_id", ASCENDING)],
         unique=True,
+    )
+    await users.create_index(
+        [("wins", -1), ("telegram_id", ASCENDING)],
+        name="player_wins_rank",
     )
     # Supports group match lookup and picks the newest match deterministically.
     await matches.create_index(
@@ -40,6 +45,26 @@ async def ensure_indexes() -> None:
     await matches.create_index(
         [("stage", ASCENDING), ("next_round.status", ASCENDING)],
         name="stage_gate_status",
+    )
+
+    # Round-specific leaderboard indexes keep category leaderboards responsive.
+    for stage in ("rlgl", "dalgona", "marbles", "bridge", "vote", "final"):
+        await users.create_index(
+            [(f"round_stats.{stage}.wins", -1), (f"round_stats.{stage}.losses", 1), ("telegram_id", 1)],
+            name=f"round_rank_{stage}",
+        )
+    await match_history.create_index([("chat_id", 1), ("finished_at", -1)], name="match_history_chat_finished")
+    await match_history.create_index(
+        [("stats_applied", ASCENDING), ("finished_at", ASCENDING)],
+        name="match_history_pending_stats",
+    )
+    await match_history.create_index(
+        [("round_history.stats_applied", ASCENDING)],
+        name="match_history_pending_round_stats",
+    )
+    await matches.create_index(
+        [("stage", ASCENDING), ("round_history.stats_applied", ASCENDING)],
+        name="match_pending_round_stats",
     )
 
     # MongoDB's built-in unique _id index identifies the welcome asset.

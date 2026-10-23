@@ -6,7 +6,9 @@ import random
 import time
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from .. import runtime, ui
-from ..manager import safe_answer, safe_edit, game_finished, refresh_lobby_scoreboard
+from ..manager import (
+    safe_answer, safe_edit, game_finished, refresh_lobby_scoreboard, _spawn_background_task,
+)
 from ..repository import get_match, save_match, alive, update_dalgona_tap
 log = logging.getLogger(__name__)
 GROUP_SHAPES = [
@@ -207,6 +209,7 @@ async def _run_game(context, mid: str) -> None:
             await asyncio.sleep(remaining - next_remaining)
         while True:
             await _delete_previous_dm_prompt(context, mid)
+            no_alive_players = False
             async with _state_lock(mid):
                 match = await get_match(mid)
                 if not match or match.get('stage') != 'dalgona':
@@ -216,23 +219,27 @@ async def _run_game(context, mid: str) -> None:
                     return
                 shape_idx = int(game.get('current_shape_index', 0))
                 alive_players = [player for player in match.get('players', []) if player.get('alive', True)]
-                if not alive_players:
-                    await _finish(context, mid, [])
-                    return
-                shape_name, seq_len, emoji = GROUP_SHAPES[shape_idx]
-                if pending_pattern and pending_pattern[0] == shape_idx:
-                    sequence = list(pending_pattern[1])
-                else:
-                    sequence = _new_sequence(seq_len)
-                game.update({'current_sequence': sequence, 'sequence_phase': 'showing', 'input_seconds': None})
-                player_states = game.setdefault('players', {})
-                for player in alive_players:
-                    state = player_states.get(str(player['id']))
-                    if not isinstance(state, dict):
-                        player['alive'] = False
-                        continue
-                    state.update({'progress': 0, 'phase': 'showing', 'done': False})
-                await save_match(match)
+                no_alive_players = not alive_players
+                if not no_alive_players:
+                    shape_name, seq_len, emoji = GROUP_SHAPES[shape_idx]
+                    if pending_pattern and pending_pattern[0] == shape_idx:
+                        sequence = list(pending_pattern[1])
+                    else:
+                        sequence = _new_sequence(seq_len)
+                    game.update({'current_sequence': sequence, 'sequence_phase': 'showing', 'input_seconds': None})
+                    player_states = game.setdefault('players', {})
+                    for player in alive_players:
+                        state = player_states.get(str(player['id']))
+                        if not isinstance(state, dict):
+                            player['alive'] = False
+                            continue
+                        state.update({'progress': 0, 'phase': 'showing', 'done': False})
+                    await save_match(match)
+            # Never call _finish while holding _state_lock: finalization also
+            # clears the previous DM prompt under that same lock.
+            if no_alive_players:
+                await _finish(context, mid, [])
+                return
             alive_players = [player for player in match.get('players', []) if player.get('alive', True)]
             if not alive_players:
                 await _finish(context, mid, [])
@@ -337,7 +344,10 @@ async def _run_game(context, mid: str) -> None:
                             dm_mid = None
                         timed_out_count += 1
                         if dm_mid:
-                            asyncio.create_task(safe_edit(context.bot, player['id'], dm_mid, "💀 <b>TIME'S UP!</b> Candy broken."))
+                            _spawn_background_task(
+                                safe_edit(context.bot, player['id'], dm_mid, "💀 <b>TIME'S UP!</b> Candy broken."),
+                                name=f"dalgona-timeout-player:{mid}:{player['id']}",
+                            )
                 game['sequence_phase'] = 'resolved'
                 rt = runtime.get(mid)
                 if rt:
@@ -435,12 +445,21 @@ async def on_press(update, context) -> None:
 
 
 async def _finish(context, mid: str, survivors: list[int], event: str | None = None) -> None:
+    """Serialize concurrent timeout/input-loop attempts to finalize Dalgona."""
+    rt = runtime.get(str(mid))
+    async with rt.setdefault('dalgona_finish_lock', asyncio.Lock()):
+        await _finish_once(context, mid, survivors, event=event)
+
+
+async def _finish_once(context, mid: str, survivors: list[int], event: str | None = None) -> None:
     """Finalize Dalgona, publish results, and continue the manager lifecycle."""
     await _delete_previous_dm_prompt(context, mid)
     match = await get_match(mid)
     if not match or match.get('stage') != 'dalgona':
         return
     game = match.setdefault('game', {})
+    if game.get('round_finished'):
+        return
     game['round_finished'] = True
     if event:
         game['last_event'] = event

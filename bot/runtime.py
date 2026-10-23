@@ -14,6 +14,10 @@ def get(match_id: str) -> dict:
         "light": "red",
         "done": False,
         "round_finalizing": False,
+        "round_finish_lock": asyncio.Lock(),
+        "champion_lock": asyncio.Lock(),
+        "bracket_advance_lock": asyncio.Lock(),
+        "dalgona_finish_lock": asyncio.Lock(),
         "phase_seq": 0,
         "phase_token": "0",
         "phase_history": {"0": {"light": "red"}},
@@ -45,6 +49,10 @@ def get(match_id: str) -> dict:
     state.setdefault("state_version", 0)
     state.setdefault("done", False)
     state.setdefault("round_finalizing", False)
+    state.setdefault("round_finish_lock", asyncio.Lock())
+    state.setdefault("champion_lock", asyncio.Lock())
+    state.setdefault("bracket_advance_lock", asyncio.Lock())
+    state.setdefault("dalgona_finish_lock", asyncio.Lock())
     state.setdefault("grid", {})
     state.setdefault("grid_version", 0)
     state.setdefault("match_snapshot", None)

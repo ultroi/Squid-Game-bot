@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import time
@@ -23,11 +24,54 @@ from ..repository import (
     clear_welcome_video_file_id,
     get_bot_stats,
     is_user_in_other_active_match,
+    record_match_interruption,
 )
 
 log = logging.getLogger(__name__)
 _welcome_video_lock = asyncio.Lock()
-_lobby_create_locks: dict[int, asyncio.Lock] = {}
+# Ref-count locks so a waiting /enterthehell request cannot be bypassed by a
+# third request that creates a new lock after the first request removes it.
+_lobby_create_locks: dict[int, tuple[asyncio.Lock, int]] = {}
+_lobby_create_locks_guard = asyncio.Lock()
+_player_join_locks: dict[int, tuple[asyncio.Lock, int]] = {}
+_player_join_locks_guard = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _ref_counted_lock(registry, guard: asyncio.Lock, key: int):
+    """Acquire a keyed lock without removing it while other tasks are waiting."""
+    async with guard:
+        current = registry.get(key)
+        if current is None:
+            lock, users = asyncio.Lock(), 0
+        else:
+            lock, users = current
+        registry[key] = (lock, users + 1)
+
+    try:
+        async with lock:
+            yield
+    finally:
+        async with guard:
+            current = registry.get(key)
+            if current is not None and current[0] is lock:
+                if current[1] <= 1:
+                    registry.pop(key, None)
+                else:
+                    registry[key] = (lock, current[1] - 1)
+
+
+@asynccontextmanager
+async def _chat_lobby_creation_lock(chat_id: int):
+    async with _ref_counted_lock(_lobby_create_locks, _lobby_create_locks_guard, chat_id):
+        yield
+
+
+@asynccontextmanager
+async def _player_join_lock(user_id: int):
+    """Serialize same-user joins across groups within this bot process."""
+    async with _ref_counted_lock(_player_join_locks, _player_join_locks_guard, user_id):
+        yield
 
 
 def extract_status_change(chat_member_update: ChatMemberUpdated) -> tuple[bool, bool] | None:
@@ -222,43 +266,40 @@ async def enter_the_hell(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("👥 Use this command inside a GROUP!")
         return
 
-    # Avoid duplicate lobbies when two /enterthehell commands arrive together.
-    lock = _lobby_create_locks.setdefault(chat.id, asyncio.Lock())
-    try:
-        async with lock:
-            existing = await get_active_match(chat.id)
-            if existing:
-                await message.reply_text("⚠️ A game is already running in this group!")
-                return
+    # Serialize lobby creation per group without dropping a lock that still has
+    # waiters. The reference-counted context manager removes idle locks safely.
+    async with _chat_lobby_creation_lock(chat.id):
+        existing = await get_active_match(chat.id)
+        if existing:
+            await message.reply_text("⚠️ A game is already running in this group!")
+            return
 
-            match = await create_match(chat.id, user.id)
-            mid = str(match["_id"])
-            match["lobby_deadline"] = time.time() + int(config.LOBBY_SECONDS)
+        match = await create_match(chat.id, user.id)
+        mid = str(match["_id"])
+        match["lobby_deadline"] = time.time() + int(config.LOBBY_SECONDS)
 
+        try:
+            msg = await message.reply_text(
+                _lobby_text(match, config.LOBBY_SECONDS),
+                reply_markup=ui.lobby_keyboard(
+                    mid,
+                    len(match.get("players", [])) >= config.MIN_PLAYERS,
+                    config.LOBBY_SECONDS,
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            match["lobby_message_id"] = msg.message_id
+            await save_match(match)
+        except Exception:
+            log.exception("Could not create lobby card for match %s", mid)
+            match["stage"] = "finished"
             try:
-                msg = await message.reply_text(
-                    _lobby_text(match, config.LOBBY_SECONDS),
-                    reply_markup=ui.lobby_keyboard(
-                        mid,
-                        len(match.get("players", [])) >= config.MIN_PLAYERS,
-                        config.LOBBY_SECONDS,
-                    ),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                match["lobby_message_id"] = msg.message_id
                 await save_match(match)
             except Exception:
-                log.exception("Could not create lobby card for match %s", mid)
-                match["stage"] = "finished"
-                try:
-                    await save_match(match)
-                except Exception:
-                    log.exception("Could not mark failed lobby %s as finished", mid)
-                raise
-            runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
-    finally:
-        _lobby_create_locks.pop(chat.id, None)
+                log.exception("Could not mark failed lobby %s as finished", mid)
+            raise
+        runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,52 +312,53 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     rt = runtime.get(mid)
 
-    async with rt.setdefault("lobby_lock", asyncio.Lock()):
-        match = await get_match(mid)
-        if not match or match.get("stage") != "lobby":
-            response = ("Lobby is closed.", True)
-        elif await is_user_in_other_active_match(uid, mid): 
-            response = ("⚠️ You are already in another active game or lobby!", True)
-        elif _lobby_seconds_left(match) <= 0:
-            response = ("Lobby timer has expired. Please wait for it to close.", True)
-        elif any(p.get("id") == uid for p in match.get("players", [])):
-            response = ("You're already registered! 👥", False)
-        elif len(match.get("players", [])) >= config.MAX_PLAYERS:
-            response = (f"Game is full ({config.MAX_PLAYERS})!", True)
-        else:
-            try:
-                welcome_message = await context.bot.send_message(
-                    chat_id=uid,
-                    text=(
-                        "✅ You joined Squid Game! "
-                    ),
-                )
-            except Forbidden:
-                me = await context.bot.get_me()
-                response = (f"⚠️ First, open @{me.username} in PM and press /start, then come back and join again!", True)
-            except Exception:
-                log.exception("Failed to send DM to Telegram user %s", uid)
-                response = ("⚠️ I couldn't message you. Open the bot in PM, press /start, and try again.", True)
+    async with _player_join_lock(uid):
+        async with rt.setdefault("lobby_lock", asyncio.Lock()):
+            match = await get_match(mid)
+            if not match or match.get("stage") != "lobby":
+                response = ("Lobby is closed.", True)
+            elif await is_user_in_other_active_match(uid, mid): 
+                response = ("⚠️ You are already in another active game or lobby!", True)
+            elif _lobby_seconds_left(match) <= 0:
+                response = ("Lobby timer has expired. Please wait for it to close.", True)
+            elif any(p.get("id") == uid for p in match.get("players", [])):
+                response = ("You're already registered! 👥", False)
+            elif len(match.get("players", [])) >= config.MAX_PLAYERS:
+                response = (f"Game is full ({config.MAX_PLAYERS})!", True)
             else:
-                # Sending the welcome DM may cross the deadline; never admit a
-                # player after timeout merely because Telegram responded slowly.
-                if _lobby_seconds_left(match) <= 0:
-                    response = ("Lobby timer has expired. Please wait for it to close.", True)
-                    match = None
-                if match is not None:
-                    await upsert_user(q.from_user)
-                    emoji = config.PLAYER_EMOJIS[len(match.get("players", [])) % len(config.PLAYER_EMOJIS)]
-                    match.setdefault("players", []).append({
-                        "id": uid,
-                        "name": q.from_user.full_name or q.from_user.first_name or str(uid),
-                        "emoji": emoji,
-                        "alive": True,
-                        "dm_mid": None,
-                        "pos": None,
-                        "reached": False,
-                    })
-                    await save_match(match)
-                    response = (f"You're in! {emoji}", False)
+                try:
+                    welcome_message = await context.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            "✅ You joined Squid Game! "
+                        ),
+                    )
+                except Forbidden:
+                    me = await context.bot.get_me()
+                    response = (f"⚠️ First, open @{me.username} in PM and press /start, then come back and join again!", True)
+                except Exception:
+                    log.exception("Failed to send DM to Telegram user %s", uid)
+                    response = ("⚠️ I couldn't message you. Open the bot in PM, press /start, and try again.", True)
+                else:
+                    # Sending the welcome DM may cross the deadline; never admit a
+                    # player after timeout merely because Telegram responded slowly.
+                    if _lobby_seconds_left(match) <= 0:
+                        response = ("Lobby timer has expired. Please wait for it to close.", True)
+                        match = None
+                    if match is not None:
+                        await upsert_user(q.from_user)
+                        emoji = config.PLAYER_EMOJIS[len(match.get("players", [])) % len(config.PLAYER_EMOJIS)]
+                        match.setdefault("players", []).append({
+                            "id": uid,
+                            "name": q.from_user.full_name or q.from_user.first_name or str(uid),
+                            "emoji": emoji,
+                            "alive": True,
+                            "dm_mid": None,
+                            "pos": None,
+                            "reached": False,
+                        })
+                        await save_match(match)
+                        response = (f"You're in! {emoji}", False)
 
     await safe_answer(q, response[0], response[1])
     if response[0].startswith("You're in!"):
@@ -438,7 +480,14 @@ async def _lobby_countdown(context, mid):
                 log.exception("Failed to auto-advance game %s", mid)
                 latest = await get_match(mid)
                 if latest and latest.get("stage") != "finished":
+                    await record_match_interruption(
+                        mid, latest.get("players", []), latest.get("round_results"),
+                        chat_id=latest.get("chat_id"),
+                        round_history=latest.get("round_history", []),
+                        reason="automatic_start_failed",
+                    )
                     latest["stage"] = "finished"
+                    latest["stats_finalized"] = True
                     await save_match(latest)
                     runtime.clear(mid)
                     await refresh_lobby_scoreboard(context, mid, force=True)
@@ -496,7 +545,14 @@ async def on_start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start_error = "⚠️ <b>FAILED TO START GAME</b>\n\nThe round could not initialize. Start a new lobby with /enterthehell."
                 latest = await get_match(mid)
                 if latest and latest.get("stage") != "finished":
+                    await record_match_interruption(
+                        mid, latest.get("players", []), latest.get("round_results"),
+                        chat_id=latest.get("chat_id"),
+                        round_history=latest.get("round_history", []),
+                        reason="manual_start_failed",
+                    )
                     latest["stage"] = "finished"
+                    latest["stats_finalized"] = True
                     await save_match(latest)
                     runtime.clear(mid)
                     await refresh_lobby_scoreboard(context, mid, force=True)
@@ -546,7 +602,7 @@ async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Fetch Admin ID from config or use fallback
-    BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
+    BOT_ADMIN = config.BOT_ADMIN_ID
 
     match_stub = await get_active_match(chat.id)
     if not match_stub:
@@ -568,7 +624,7 @@ async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_authorized = True
     else:
         try:
-            member = await chat.get_member(user.id)
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
             if member.status in ("administrator", "creator"):
                 is_authorized = True
         except Exception:
@@ -578,33 +634,48 @@ async def cancel_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat.id, text="❌ You don't have permission to cancel the game. Only the host, group admins, or bot admin can do this.")
         return
 
-    # Perform Cancellation Safely
+    # Serialize cancellation with lobby transitions, round completion and champion
+    # recording. Lock order matches the game flow: round-finalize -> champion.
     rt = runtime.get(mid)
+    latest = None
+    already_finished = False
     async with rt.setdefault("lobby_lock", asyncio.Lock()):
-        latest = await get_match(mid)
-        if not latest or latest.get("stage") == "finished":
-            await context.bot.send_message(chat_id=chat.id, text="⚠️ The game is already finished or doesn't exist.")
-            return
-        
-        latest["stage"] = "finished"
-        await save_match(latest)
-        runtime.clear(mid)
-        
-        # Update the active UI card to reflect cancellation
-        msg_id = latest.get("round_message_id") or latest.get("lobby_message_id")
-        if msg_id:
-            try:
-                await safe_edit(
-                    context.bot,
-                    chat.id,
-                    msg_id,
-                    "🛑 <b>GAME CANCELLED</b>\n\nThis match was forcefully cancelled by an admin.",
-                    reply_markup=ui.kb([])
-                )
-            except Exception:
-                pass
-        
-        await context.bot.send_message(chat_id=chat.id, text="✅ The active game has been successfully cancelled.")
+        async with rt.setdefault("round_finish_lock", asyncio.Lock()):
+            async with rt.setdefault("champion_lock", asyncio.Lock()):
+                latest = await get_match(mid)
+                if not latest or latest.get("stage") == "finished":
+                    already_finished = True
+                else:
+                    await record_match_interruption(
+                        mid, latest.get("players", []), latest.get("round_results"),
+                        chat_id=latest.get("chat_id"),
+                        round_history=latest.get("round_history", []),
+                        reason="cancelled_by_authorized_user",
+                    )
+                    latest["stage"] = "finished"
+                    latest["stats_finalized"] = True
+                    await save_match(latest)
+                    runtime.clear(mid)
+
+    if already_finished or latest is None:
+        await context.bot.send_message(chat_id=chat.id, text="⚠️ The game is already finished or doesn't exist.")
+        return
+
+    # Network requests happen after the terminal state is persisted and locks are released.
+    msg_id = latest.get("round_message_id") or latest.get("lobby_message_id")
+    if msg_id:
+        try:
+            await safe_edit(
+                context.bot,
+                chat.id,
+                msg_id,
+                "🛑 <b>GAME CANCELLED</b>\n\nThis match was forcefully cancelled by an admin.",
+                reply_markup=ui.kb([]),
+            )
+        except Exception:
+            log.debug("Could not update cancelled match message %s", msg_id, exc_info=True)
+
+    await context.bot.send_message(chat_id=chat.id, text="✅ The active game has been successfully cancelled.")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -613,7 +684,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Optional: If you want only the bot admin to see stats, uncomment the lines below
-    # BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
+    # BOT_ADMIN = config.BOT_ADMIN_ID
     # if update.effective_user.id != BOT_ADMIN:
     #     return
 
@@ -645,6 +716,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /enterthehell - Start a new game lobby in a group.\n"
         "• /cancelgame - Forcefully end an active game (Admin/Host only).\n"
         "• /stats - View global bot statistics.\n"
+        "• /mystats - View your Squid Game profile and round-by-round stats.\n"
+        "• /leaderboard - Overall wins and each round's leaderboard.\n"
         "• /help - Show this comprehensive guide.\n"
         "• /report - to report a bug and give a suggestion.\n"
     )
@@ -719,6 +792,8 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /enterthehell - Start a new game lobby in a group.\n"
             "• /cancelgame - Forcefully end an active game (Admin/Host only).\n"
             "• /stats - View global bot statistics.\n"
+            "• /mystats - View your Squid Game profile and round-by-round stats.\n"
+            "• /leaderboard - Overall wins and each round's leaderboard.\n"
             "• /help - Show this comprehensive guide.\n"
             "• /report - to report a bug and give a suggestion.\n"
         )
@@ -760,7 +835,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_text = args[1] if len(args) > 1 else "<i>(Media attached without extra text)</i>"
     
     # Fetch Admin ID from config or use fallback
-    BOT_ADMIN = getattr(config, "BOT_ADMIN_ID", 6439532660)
+    BOT_ADMIN = config.BOT_ADMIN_ID
 
     # Auto-detect location data
     chat_type = chat.type.capitalize()

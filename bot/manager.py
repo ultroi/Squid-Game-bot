@@ -7,7 +7,11 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, RetryAfter
 
 from . import config, runtime, ui
-from .repository import get_match, save_match, alive, get_player, add_win, record_game_start
+from .repository import (
+    get_match, save_match, alive, get_player, record_game_start,
+    record_match_participation, record_round_participation, record_match_result,
+    record_match_interruption,
+)
 
 log = logging.getLogger(__name__)
 
@@ -400,7 +404,104 @@ def _round_module(stage):
     }.get(stage)
 
 
+def _append_round_history(match, stage, round_id, qualified_ids, eliminated_ids, completed_at=None):
+    """Keep each stage/bracket result permanently distinguishable within a match."""
+    history = match.setdefault("round_history", [])
+    if any(str(item.get("round_id")) == str(round_id) for item in history):
+        return
+    history.append({
+        "round_id": str(round_id),
+        "stage": str(stage),
+        "qualified_ids": list(qualified_ids or []),
+        "eliminated_ids": list(eliminated_ids or []),
+        "completed_at": float(completed_at or time.time()),
+        # Durable recovery marker: save the outcome before updating user counters.
+        "stats_applied": False,
+    })
+
+
+def _mark_round_stats_applied(match, round_id) -> None:
+    for item in match.get("round_history", []):
+        if str(item.get("round_id")) == str(round_id):
+            item["stats_applied"] = True
+            return
+
+
+async def reconcile_pending_round_statistics(limit: int = 1000) -> int:
+    """Replay durable round-history entries left pending by a process/database failure."""
+    from .database import matches, match_history
+
+    limit = max(1, min(int(limit), 10000))
+    reconciled = 0
+
+    async def reconcile_doc(collection, document, *, is_match: bool) -> int:
+        match_id = str(document.get("_id") or document.get("match_id") or "")
+        if not match_id:
+            return 0
+        history = document.get("round_history") or []
+        changed = False
+        successes = 0
+        for item in history:
+            if item.get("stats_applied") is not False:
+                continue
+            try:
+                await record_round_participation(
+                    match_id, str(item.get("stage") or ""),
+                    item.get("qualified_ids") or [], item.get("eliminated_ids") or [],
+                    round_id=str(item.get("round_id") or item.get("stage") or ""),
+                )
+                item["stats_applied"] = True
+                changed = True
+                successes += 1
+            except Exception:
+                log.exception(
+                    "Could not reconcile round stats (match=%s round=%s)",
+                    match_id, item.get("round_id"),
+                )
+        if changed:
+            if is_match:
+                document["round_history"] = history
+                await save_match(document)
+            else:
+                await collection.update_one(
+                    {"_id": document["_id"]},
+                    {"$set": {"round_history": history}},
+                )
+        return successes
+
+    try:
+        cursor = matches.find({"round_history.stats_applied": False}).batch_size(100)
+        async for document in cursor:
+            try:
+                reconciled += await reconcile_doc(matches, document, is_match=True)
+            except Exception:
+                log.exception("Could not reconcile pending round stats for match %s", document.get("_id"))
+            if reconciled >= limit:
+                return reconciled
+
+        cursor = match_history.find({"round_history.stats_applied": False}).batch_size(100)
+        async for document in cursor:
+            try:
+                reconciled += await reconcile_doc(match_history, document, is_match=False)
+            except Exception:
+                log.exception("Could not reconcile pending round stats for history %s", document.get("_id"))
+            if reconciled >= limit:
+                break
+    except Exception:
+        log.exception("Could not scan pending round-stat records")
+    return reconciled
+
+
 async def game_finished(context, mid, survivor_ids, title):
+    """Serialize round finalization so competing timeout/callback paths cannot
+    open multiple gates or send duplicate results for the same round.
+    """
+    state = runtime.get(str(mid))
+    async with state.setdefault("round_finish_lock", asyncio.Lock()):
+        await _game_finished_once(context, mid, survivor_ids, title)
+
+
+async def _game_finished_once(context, mid, survivor_ids, title):
     match = await get_match(mid)
     if not match or match.get("stage") in {"finished", "intermission"}:
         return
@@ -441,7 +542,22 @@ async def game_finished(context, mid, survivor_ids, title):
         "eliminated_ids": eliminated_ids,
         "completed_at": time.time(),
     }
+    round_id = (
+        f"final:{int((match.get('game') or {}).get('bracket_round', 1))}"
+        if previous_stage == "final" else previous_stage
+    )
+    _append_round_history(
+        match, previous_stage, round_id, qualified_ids, eliminated_ids,
+        completed_at=match["round_results"][previous_stage]["completed_at"],
+    )
     match["round_preparing"] = False
+    # Persist qualified/eliminated IDs before touching several user documents. If
+    # a write fails, startup reconciliation can replay this pending round event.
+    await save_match(match)
+    await record_round_participation(
+        mid, previous_stage, qualified_ids, eliminated_ids, round_id=round_id
+    )
+    _mark_round_stats_applied(match, round_id)
     await save_match(match)
     await refresh_lobby_scoreboard(context, mid, force=True)
 
@@ -484,11 +600,20 @@ async def game_finished(context, mid, survivor_ids, title):
     if not survivors:
         match["stage"] = "finished"
         match["next_round"] = {"status": "closed", "from_stage": previous_stage}
+        await record_match_result(
+            mid, match.get("players", []), None, match.get("round_results"),
+            chat_id=match.get("chat_id"), round_history=match.get("round_history", []),
+            reason="no_players_qualified",
+        )
+        match["stats_finalized"] = True
         await save_match(match)
 
         scoreboard_id = match.get("scoreboard_message_id")
         if scoreboard_id:
-            asyncio.create_task(delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0))
+            _spawn_background_task(
+                delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0),
+                name=f"unpin-board:{mid}",
+            )
             
         game_state = match.get("game") or {}
         if not game_state.get("final_group_result_message_id"):
@@ -739,6 +864,14 @@ async def _close_next_round_gate(context, mid, force=False):
         await _delete_group_message(context, chat_id_cache, gate_message_id)
 
     if no_entrants:
+        if match and not match.get("stats_finalized"):
+            await record_match_result(
+                mid, match.get("players", []), None, match.get("round_results"),
+                chat_id=match.get("chat_id"), round_history=match.get("round_history", []),
+                reason="no_next_round_entries",
+            )
+            match["stats_finalized"] = True
+            await save_match(match)
         await refresh_lobby_scoreboard(context, mid, force=True)
         closed_text = (
             "🛑 <b>ENTRY WINDOW CLOSED</b>\n\n"
@@ -809,30 +942,28 @@ async def resume_pending_next_round_gates(application):
     from types import SimpleNamespace
     from .database import matches
 
+    context = SimpleNamespace(bot=application.bot)
     try:
-        pending = await matches.find({
+        cursor = matches.find({
             "stage": "intermission",
             "next_round.status": "open",
-        }).to_list(length=1000)
+        }).batch_size(100)
+        async for match in cursor:
+            match_id = str(match.get("_id", ""))
+            if not match_id:
+                continue
+            # Starting the same timeout task twice in one process is unnecessary.
+            state = runtime.get(match_id)
+            if any(not task.done() and task.get_name() == f"next-round-gate:{match_id}"
+                   for task in state.get("tasks", [])):
+                continue
+            task = asyncio.create_task(
+                _next_round_entry_timeout(context, match_id),
+                name=f"next-round-gate:{match_id}",
+            )
+            runtime.add_task(match_id, task)
     except Exception:
         log.exception("Could not recover pending next-round entry windows")
-        return
-
-    context = SimpleNamespace(bot=application.bot)
-    for match in pending:
-        match_id = str(match.get("_id", ""))
-        if not match_id:
-            continue
-        # Starting the same timeout task twice in one process is unnecessary.
-        state = runtime.get(match_id)
-        if any(not task.done() and task.get_name() == f"next-round-gate:{match_id}"
-               for task in state.get("tasks", [])):
-            continue
-        task = asyncio.create_task(
-            _next_round_entry_timeout(context, match_id),
-            name=f"next-round-gate:{match_id}",
-        )
-        runtime.add_task(match_id, task)
 
 
 async def open_final_bracket_gate(context, mid, qualified_ids):
@@ -863,6 +994,20 @@ async def open_final_bracket_gate(context, mid, qualified_ids):
         "eliminated_ids": eliminated_ids,
         "completed_at": now,
     }
+    bracket_round = int((match.get("game") or {}).get("bracket_round", 1))
+    final_round_id = f"final:{bracket_round}"
+    _append_round_history(
+        match, "final", final_round_id, qualified_ids, eliminated_ids, completed_at=now
+    )
+    # Persist the bracket result while this match is still in the Final stage.
+    # If progression writes fail, startup can replay the pending history item.
+    await save_match(match)
+    await record_round_participation(
+        mid, "final", qualified_ids, eliminated_ids, round_id=final_round_id,
+    )
+    _mark_round_stats_applied(match, final_round_id)
+    await save_match(match)
+
     match["stage"] = "intermission"
     match["next_round"] = {
         "status": "open",
@@ -902,6 +1047,12 @@ async def advance(context, mid):
     players = alive(match)
     if len(players) == 0:
         match["stage"] = "finished"
+        await record_match_result(
+            mid, match.get("players", []), None, match.get("round_results"),
+            chat_id=match.get("chat_id"), round_history=match.get("round_history", []),
+            reason="no_survivors_at_start",
+        )
+        match["stats_finalized"] = True
         await save_match(match)
         runtime.clear(mid)
         await _edit_round_card(
@@ -924,6 +1075,7 @@ async def advance(context, mid):
     match.setdefault("round_results", {})
     await save_match(match)
     await record_game_start(match["chat_id"])
+    await record_match_participation(mid, [player.get("id") for player in players if player.get("id") is not None])
     await refresh_lobby_scoreboard(context, mid, force=True)
     runtime.clear(mid)  
     module = _round_module(target_stage)
@@ -932,8 +1084,17 @@ async def advance(context, mid):
 
 
 async def crown(context, mid, winner_id):
+    """Idempotently finalize a champion even if several game callbacks race."""
+    state = runtime.get(str(mid))
+    async with state.setdefault("champion_lock", asyncio.Lock()):
+        await _crown_once(context, mid, winner_id)
+
+
+async def _crown_once(context, mid, winner_id):
     match = await get_match(mid)
     if not match:
+        return
+    if match.get("stage") == "finished" and match.get("stats_finalized"):
         return
     winner = get_player(match, winner_id)
     if not winner:
@@ -942,36 +1103,79 @@ async def crown(context, mid, winner_id):
         
     current_stage = match.get("current_round_stage")
     round_results = match.setdefault("round_results", {})
-    if current_stage and current_stage not in round_results:
-        entrant_ids = {str(uid) for uid in (match.get("current_round_player_ids") or [])}
-        if not entrant_ids:
-            entrant_ids = {str(p.get("id")) for p in match.get("players", []) if p.get("alive", True)}
-        qualified = [winner_id] if str(winner_id) in entrant_ids else []
-        eliminated = [p.get("id") for p in match.get("players", [])
-                      if str(p.get("id")) in entrant_ids and str(p.get("id")) != str(winner_id)]
-        round_results[current_stage] = {
-            "qualified_ids": qualified,
-            "eliminated_ids": eliminated,
-            "completed_at": time.time(),
-        }
-        
+    if current_stage:
+        round_id = (
+            f"final:{int((match.get('game') or {}).get('bracket_round', 1))}"
+            if current_stage == "final" else current_stage
+        )
+        history_entry = next(
+            (item for item in (match.get("round_history") or [])
+             if str(item.get("round_id")) == str(round_id)),
+            None,
+        )
+        if history_entry is None:
+            entrant_ids = {str(uid) for uid in (match.get("current_round_player_ids") or [])}
+            if not entrant_ids:
+                entrant_ids = {str(p.get("id")) for p in match.get("players", []) if p.get("alive", True)}
+            qualified = [winner_id] if str(winner_id) in entrant_ids else []
+            eliminated = [
+                p.get("id") for p in match.get("players", [])
+                if str(p.get("id")) in entrant_ids and str(p.get("id")) != str(winner_id)
+            ]
+            round_results[current_stage] = {
+                "qualified_ids": qualified,
+                "eliminated_ids": eliminated,
+                "completed_at": time.time(),
+            }
+            _append_round_history(
+                match, current_stage, round_id, qualified, eliminated,
+                completed_at=round_results[current_stage]["completed_at"],
+            )
+            history_entry = next(
+                item for item in match["round_history"]
+                if str(item.get("round_id")) == str(round_id)
+            )
+            # Durably save the outcome before the per-player updates.
+            await save_match(match)
+
+        # Only new records carry stats_applied=False. Missing is treated as legacy
+        # history that predates the marker rather than replaying old events.
+        if history_entry.get("stats_applied") is False:
+            await record_round_participation(
+                mid, current_stage,
+                history_entry.get("qualified_ids") or [],
+                history_entry.get("eliminated_ids") or [],
+                round_id=round_id,
+            )
+            _mark_round_stats_applied(match, round_id)
+            await save_match(match)
+
+
     match["stage"] = "finished"
     match["round_preparing"] = False
     match["champion_id"] = winner_id
     gate = match.get("next_round")
     if gate:
         gate["status"] = "closed"
-        
+
+    await record_match_result(
+        mid, match.get("players", []), int(winner_id), match.get("round_results"),
+        chat_id=match.get("chat_id"), round_history=match.get("round_history", []),
+        reason="champion_crowned",
+    )
+    match["stats_finalized"] = True
     await save_match(match)
     await refresh_lobby_scoreboard(context, mid, force=True)
     
     # 🟢 Match board unpin with a 4-second delay after winning
     scoreboard_id = match.get("scoreboard_message_id")
     if scoreboard_id:
-        asyncio.create_task(delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0))
+        _spawn_background_task(
+            delayed_unpin_board(context, match["chat_id"], scoreboard_id, delay=4.0),
+            name=f"unpin-board:{mid}",
+        )
 
     runtime.clear(mid)
-    await add_win(winner_id)
 
     winner_name = html.escape(str(winner.get("name") or winner_id))
     winner_emoji = html.escape(str(winner.get("emoji") or "🏆"))
@@ -992,44 +1196,49 @@ async def crown(context, mid, winner_id):
 
 
 async def cleanup_interrupted_games(application):
-    """Terminate active games that lost their runtime state due to a restart."""
+    """Persist and terminate active games that lost process-local runtime state."""
     from types import SimpleNamespace
     from .database import matches
 
-    try:
-        # Fetch any match stuck in an active mini-game stage
-        interrupted = await matches.find({
-            "stage": {"$nin": ["lobby", "intermission", "finished"]}
-        }).to_list(length=1000)
-    except Exception:
-        log.exception("Could not retrieve interrupted games during startup")
-        return
-
-    if not interrupted:
-        return
-
     context = SimpleNamespace(bot=application.bot)
-    log.info("Cleaning up %s interrupted match(es)...", len(interrupted))
+    processed = 0
+    try:
+        cursor = matches.find({
+            "stage": {"$nin": ["lobby", "intermission", "finished"]}
+        }).batch_size(100)
+        async for match in cursor:
+            mid = str(match.get("_id", ""))
+            if not mid:
+                continue
+            processed += 1
+            try:
+                await record_match_interruption(
+                    mid, match.get("players", []), match.get("round_results"),
+                    chat_id=match.get("chat_id"),
+                    round_history=match.get("round_history", []),
+                    reason="interrupted_by_restart",
+                )
+            except Exception:
+                # Still attempt to close a stale match; a history failure is logged.
+                log.exception("Could not persist interruption history for match %s", mid)
 
-    for match in interrupted:
-        mid = str(match.get("_id", ""))
-        if not mid:
-            continue
-
-        match["stage"] = "finished"
-        match.setdefault("game", {})["round_finished"] = True
-        
-        closed_text = (
-            "🛑 <b>GAME TERMINATED</b>\n\n"
-            "The bot server was restarted for maintenance while this round was in progress.\n"
-            "Please start a new lobby with /enterthehell."
-        )
-        
-        try:
-            # save_match triggers the 60-second delayed deletion because stage is "finished"
-            await save_match(match)
-            runtime.clear(mid)
-            await refresh_lobby_scoreboard(context, mid, force=True)
-            await _edit_round_card(context, match, closed_text, reply_markup=ui.kb([]))
-        except Exception:
-            log.exception("Failed to clean up interrupted match %s", mid)
+            match["stage"] = "finished"
+            match["stats_finalized"] = True
+            match.setdefault("game", {})["round_finished"] = True
+            closed_text = (
+                "🛑 <b>GAME TERMINATED</b>\n\n"
+                "The bot server restarted while this round was in progress.\n"
+                "Please start a new lobby with /enterthehell."
+            )
+            try:
+                await save_match(match)
+                runtime.clear(mid)
+                await refresh_lobby_scoreboard(context, mid, force=True)
+                await _edit_round_card(context, match, closed_text, reply_markup=ui.kb([]))
+            except Exception:
+                log.exception("Failed to clean up interrupted match %s", mid)
+    except Exception:
+        log.exception("Could not scan interrupted games during startup")
+        return
+    if processed:
+        log.info("Cleaned up %s interrupted match(es).", processed)
