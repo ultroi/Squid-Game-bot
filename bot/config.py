@@ -77,3 +77,4 @@ WELCOME_CAPTION = (
     "🩸 Play smart, survive every round, and fight to be the last one standing!\n\n"
     "Good luck, Players. Let the games begin! 🔴🔺🟥\n"
     "💡 Use /help to see available commands and how to play."
+)

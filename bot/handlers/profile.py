@@ -1,4 +1,3 @@
-"""Player profile card and /mystats command for the Squid Game bot."""
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +12,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
+
+from cachetools import TTLCache
 
 from ..repository import get_player_profile, get_player_rank, upsert_user
 
@@ -62,8 +63,7 @@ _ROUND_ICONS = {
 # ----------------- Rate Limiting -----------------
 REFRESH_COOLDOWN = 3.0
 VIEW_COOLDOWN = 1.0
-_LAST_ACTION_TAP: dict[str, float] = {}
-
+_LAST_ACTION_TAP = TTLCache(maxsize=2000, ttl=60.0)
 
 def _is_rate_limited(user_id: int, action: str, cooldown: float) -> bool:
     """Check if the user is spamming profile actions."""
@@ -71,18 +71,11 @@ def _is_rate_limited(user_id: int, action: str, cooldown: float) -> bool:
     key = f"{user_id}:{action}"
     last_tap = _LAST_ACTION_TAP.get(key, 0.0)
 
-    if len(_LAST_ACTION_TAP) > 2000:
-        cutoff = now - 60.0
-        for k in list(_LAST_ACTION_TAP.keys()):
-            if _LAST_ACTION_TAP[k] < cutoff:
-                _LAST_ACTION_TAP.pop(k, None)
-
     if now - last_tap < cooldown:
         return True
 
     _LAST_ACTION_TAP[key] = now
     return False
-
 
 # ----------------------------------------------------------------------------
 # Drawing helpers
@@ -142,7 +135,6 @@ def _draw_symbol(draw, kind: str, center: tuple[int, int], radius: int, color, w
 def _build_vibrant_background() -> Image.Image:
     """Create a rich, illuminated cyber-arena background with subtle corner glows."""
     w, h = _SIZE
-    # Small resolution gradient + bilinear upscale for fast, smooth ambient lighting
     gw, gh = 160, 92
     grad = Image.new("RGB", (gw, gh))
     pixels = grad.load()
@@ -151,19 +143,16 @@ def _build_vibrant_background() -> Image.Image:
          yf = y / (gh - 1)
          for x in range(gw):
              xf = x / (gw - 1)
-             # Base vertical gradient
              r = _BG_TOP[0] * (1 - yf) + _BG_BOT[0] * yf
              g = _BG_TOP[1] * (1 - yf) + _BG_BOT[1] * yf
              b = _BG_TOP[2] * (1 - yf) + _BG_BOT[2] * yf
 
-             # Top-left Pink Ambient Glow
              d_pink = ((xf - 0.08) ** 2 + (yf - 0.12) ** 2) ** 0.5
              glow_p = max(0.0, 1.0 - d_pink * 1.45) ** 2 * 0.32
              r += (_PINK[0] - r) * glow_p
              g += (_PINK[1] - g) * glow_p
              b += (_PINK[2] - b) * glow_p
 
-             # Bottom-right Emerald Green Ambient Glow
              d_green = ((xf - 0.88) ** 2 + (yf - 0.85) ** 2) ** 0.5
              glow_g = max(0.0, 1.0 - d_green * 1.35) ** 2 * 0.26
              r += (_GREEN[0] - r) * glow_g
@@ -175,12 +164,20 @@ def _build_vibrant_background() -> Image.Image:
     bg = grad.resize(_SIZE, Image.Resampling.BILINEAR)
     draw = ImageDraw.Draw(bg)
 
-    # Subtle cyber dot-matrix pattern
     for y in range(28, h, 36):
         for x in range(28, w, 36):
             draw.point((x, y), fill=(48, 60, 90))
-
     return bg
+
+# GLOBAL BACKGROUND CACHE
+_CACHED_BACKGROUND = None
+
+def _get_or_create_background() -> Image.Image:
+    """Returns a fast memory copy of the pre-computed static background."""
+    global _CACHED_BACKGROUND
+    if _CACHED_BACKGROUND is None:
+        _CACHED_BACKGROUND = _build_vibrant_background()
+    return _CACHED_BACKGROUND.copy()
 
 
 def _donut(
@@ -191,8 +188,8 @@ def _donut(
     thickness: int,
     track: tuple[int, int, int] | None = _TRACK,
 ) -> None:
-    """Anti-aliased donut chart (supersampled 4x, then pasted)."""
-    ss = 4
+    # OPTIMIZATION: Dropped supersampling from 4x to 2x for massive CPU saving
+    ss = 2
     d = diameter * ss
     t = thickness * ss
     layer = Image.new("RGBA", (d, d), (0, 0, 0, 0))
@@ -235,7 +232,8 @@ def _make_avatar(raw: bytes | None, display_name: str, size: int) -> Image.Image
         initials = "".join(part[0] for part in display_name.split()[:2]).upper() or "SG"
         _center_text(d, (size // 2, size // 2), initials[:2], _font(int(size * 0.36), True), _GREEN)
 
-    ss = 4
+    # OPTIMIZATION: Dropped supersampling from 4x to 2x
+    ss = 2
     mask = Image.new("L", (size * ss, size * ss), 0)
     ImageDraw.Draw(mask).ellipse((0, 0, size * ss - 1, size * ss - 1), fill=255)
     mask = mask.resize((size, size), Image.Resampling.LANCZOS)
@@ -282,7 +280,6 @@ def _panel(draw, box, accent: tuple[int, int, int] | None = None, radius: int = 
     x1, y1, x2, y2 = box
     draw.rounded_rectangle(box, radius=radius, fill=_PANEL, outline=_PANEL_BORDER, width=2)
     if accent:
-        # Sleek top neon highlight bar
         draw.rounded_rectangle((x1 + 28, y1, x2 - 28, y1 + 5), radius=2, fill=accent)
 
 
@@ -309,7 +306,8 @@ def _chart_panel(image, draw, box, title, subtitle, center_value, center_label, 
 
 def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | None) -> io.BytesIO:
     width, height = _SIZE
-    image = _build_vibrant_background()
+    # OPTIMIZATION: Pull background from memory cache instead of calculating it
+    image = _get_or_create_background()
     draw = ImageDraw.Draw(image)
 
     uid = profile.get("telegram_id", 0)
@@ -336,22 +334,18 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
 
     round_stats = profile.get("round_stats") or profile.get("stage_stats") or {}
 
-    # ---- Top Header Bar ----------------------------------------------------
     _draw_symbol(draw, "circle", (52, 42), 11, _PINK, width=3)
     _draw_symbol(draw, "triangle", (82, 42), 11, _WHITE, width=3)
     _draw_symbol(draw, "square", (112, 42), 11, _GREEN, width=3)
     draw.text((138, 42), "SQUID GAME  ·  OFFICIAL DOSSIER", font=_font(20, True), fill=_WHITE, anchor="lm")
 
-    # Top-right Player Number Pill
     draw.rounded_rectangle((width - 215, 24, width - 38, 60), radius=12, fill=(20, 48, 46), outline=_GREEN, width=2)
     _center_text(draw, (width - 126, 42), f"CONTENDER #{player_num}", _font(14, True), _GREEN)
 
-    # ---- Left Panel: Player Identity ---------------------------------------
     lx1, ly1, lx2, ly2 = 38, 80, 418, 702
     _panel(draw, (lx1, ly1, lx2, ly2), accent=_PINK, radius=26)
     cx = (lx1 + lx2) // 2
 
-    # Glowing Avatar Ring
     avatar_size = 152
     cy = ly1 + 122
     _donut(image, (cx, cy), avatar_size + 24, [(1, (38, 85, 80))], thickness=4, track=None)
@@ -359,15 +353,12 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
     avatar = _make_avatar(avatar_bytes, name, avatar_size)
     image.paste(avatar, (cx - avatar_size // 2, cy - avatar_size // 2), avatar)
 
-    # Floating Player Number Tag over bottom of avatar
     draw.rounded_rectangle((cx - 56, cy + 58, cx + 56, cy + 88), radius=10, fill=_PINK, outline=_PANEL, width=3)
     _center_text(draw, (cx, cy + 73), f"NO. {player_num}", _font(14, True), _WHITE)
 
-    # Name & Handle
     _center_text(draw, (cx, ly1 + 244), name, _fit_text(draw, name, 330, 30, True), _WHITE)
     _center_text(draw, (cx, ly1 + 278), handle[:30], _font(15), _MUTED)
 
-    # 2-Column Stat Pills inside Identity Card (Rank & Played)
     rank_label = f"#{rank:,}" if rank is not None else "UNRANKED"
     rank_color = _GOLD if rank is not None else _MUTED
 
@@ -375,30 +366,25 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
     b1_x1, b1_y1 = lx1 + 28, ly1 + 312
     b2_x1 = b1_x1 + p_w + 14
 
-    # Pill 1: Global Rank
     draw.rounded_rectangle((b1_x1, b1_y1, b1_x1 + p_w, b1_y1 + 78), radius=16, fill=_PANEL_INNER, outline=(50, 64, 95), width=1)
     draw.text((b1_x1 + 16, b1_y1 + 16), "GLOBAL RANK", font=_font(11, True), fill=_MUTED)
     draw.text((b1_x1 + 16, b1_y1 + 38), rank_label, font=_fit_text(draw, rank_label, p_w - 28, 22, True), fill=rank_color)
 
-    # Pill 2: Matches Played
     draw.rounded_rectangle((b2_x1, b1_y1, b2_x1 + p_w, b1_y1 + 78), radius=16, fill=_PANEL_INNER, outline=(50, 64, 95), width=1)
     draw.text((b2_x1 + 16, b1_y1 + 16), "GAMES PLAYED", font=_font(11, True), fill=_MUTED)
     draw.text((b2_x1 + 16, b1_y1 + 38), f"{matches_played:,}", font=_fit_text(draw, f"{matches_played:,}", p_w - 28, 22, True), fill=_CYAN)
 
-    # Full-width Pill: Clearance Tier
     c_y1 = b1_y1 + 94
     draw.rounded_rectangle((lx1 + 28, c_y1, lx2 - 28, c_y1 + 76), radius=16, fill=_PANEL_INNER, outline=(50, 64, 95), width=1)
     draw.rounded_rectangle((lx1 + 40, c_y1 + 16, lx1 + 46, c_y1 + 60), radius=3, fill=tier_color)
     draw.text((lx1 + 60, c_y1 + 16), "CLEARANCE TIER", font=_font(11, True), fill=_MUTED)
     draw.text((lx1 + 60, c_y1 + 36), tier_label, font=_fit_text(draw, tier_label, 270, 20, True), fill=tier_color)
 
-    # Full-width Pill: Equipped Title
     t_y1 = c_y1 + 92
     draw.rounded_rectangle((lx1 + 28, t_y1, lx2 - 28, t_y1 + 78), radius=16, fill=(38, 24, 48), outline=(110, 42, 80), width=1)
     draw.text((lx1 + 46, t_y1 + 16), "EQUIPPED TITLE", font=_font(11, True), fill=_PINK)
     draw.text((lx1 + 46, t_y1 + 38), tag[:26], font=_fit_text(draw, tag[:26], 290, 19, True), fill=_WHITE)
 
-    # ---- Right Top: Donut Chart Panels -------------------------------------
     rx1, rx2 = 442, 1242
     pw = (rx2 - rx1 - 22) // 2
 
@@ -423,7 +409,6 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
         ],
     )
 
-    # ---- Right Bottom: Round Performance Breakdown -------------------------
     py1, py2 = 374, 702
     _panel(draw, (rx1, py1, rx2, py2), accent=_CYAN, radius=24)
     draw.text((rx1 + 28, py1 + 22), "ROUND-BY-ROUND TELEMETRY", font=_font(16, True), fill=_WHITE)
@@ -438,10 +423,8 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
         s_total = max(_as_int(stats.get("played")), s_ok + s_out)
         rate = (s_ok / s_total * 100) if s_total else 0.0
 
-        # Subtle row highlight pill
         draw.rounded_rectangle((rx1 + 20, cy_row - 16, rx2 - 20, cy_row + 16), radius=10, fill=_PANEL_INNER)
 
-        # Round geometric icon + title
         sym_color = _rate_color(rate) if s_total else _DIM
         _draw_symbol(draw, sym, (rx1 + 42, cy_row), 7, sym_color, width=2)
         draw.text(
@@ -452,7 +435,6 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
             anchor="lm",
         )
 
-        # Progress bar track
         draw.rounded_rectangle((bar_x1, cy_row - 6, bar_x2, cy_row + 6), radius=6, fill=_TRACK)
         if s_total:
             if s_out:
@@ -461,7 +443,6 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
                 fill_x = bar_x1 + max(12, int((bar_x2 - bar_x1) * s_ok / s_total))
                 draw.rounded_rectangle((bar_x1, cy_row - 6, fill_x, cy_row + 6), radius=6, fill=_rate_color(rate))
 
-            # Score counter + Percentage on the right
             draw.text((rx2 - 110, cy_row), f"{s_ok}/{s_total}", font=_font(13, True), fill=_MUTED, anchor="rm")
             draw.text((rx2 - 34, cy_row), f"{rate:.0f}%", font=_font(16, True), fill=_rate_color(rate), anchor="rm")
         else:
@@ -469,7 +450,8 @@ def render_profile_card(profile: dict, rank: int | None, avatar_bytes: bytes | N
             draw.text((rx2 - 34, cy_row), "—", font=_font(16, True), fill=_DIM, anchor="rm")
 
     output = io.BytesIO()
-    image.save(output, format="PNG", optimize=True)
+    # OPTIMIZATION: compress_level=1 eliminates heavy zlib compression lag
+    image.save(output, format="PNG", compress_level=1)
     output.seek(0)
     output.name = "squid_game_dossier.png"
     return output
@@ -670,7 +652,6 @@ async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_profile_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback handler for `prof:refresh:<uid>` button presses with flood protection."""
     query = update.callback_query
     if query is None or query.from_user is None:
         return

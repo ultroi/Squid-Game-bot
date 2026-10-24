@@ -9,12 +9,13 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from telegram.ext import ChatMemberHandler
 from bot.config import BOT_TOKEN, LOG_LEVEL
 from bot.database import ensure_indexes, close_database
-from bot.repository import cleanup_stale_finished_matches, reconcile_pending_match_statistics
-from bot.handlers import lobby, profile, leaderboard
+from bot.handlers import lobby, profile, leaderboard, broadcast
 from bot.games import rlgl, dalgona, marbles, bridge, voting, final
 from bot.handlers.lobby import restore_lobby_timers
 from bot import manager
@@ -89,28 +90,8 @@ async def start_health_server() -> asyncio.AbstractServer:
 
 async def post_init(app: Application) -> None:
     await ensure_indexes()
+    await broadcast.mark_interrupted_jobs()
     log.info("Database ready")
-
-    try:
-        deleted = await cleanup_stale_finished_matches()
-        if deleted:
-            log.info("Removed %s stale finished match document(s).", deleted)
-    except Exception:
-        log.exception("Could not clean up stale finished match documents")
-
-    # Finish any idempotent persistence work left pending by an earlier failure
-    # before recovering timers or accepting new game actions.
-    try:
-        recovered_rounds = await manager.reconcile_pending_round_statistics()
-        recovered_matches = await reconcile_pending_match_statistics()
-        if recovered_rounds or recovered_matches:
-            log.info(
-                "Recovered pending progression records: %s round event(s), %s match result(s).",
-                recovered_rounds, recovered_matches,
-            )
-    except Exception:
-        # A reconciliation failure is logged and left retryable for next startup.
-        log.exception("Could not fully reconcile pending progression records")
 
     await restore_lobby_timers(app)
     await manager.resume_pending_next_round_gates(app)
@@ -119,11 +100,6 @@ async def post_init(app: Application) -> None:
         await cleanup_interrupted_games(app)
     else:
         log.warning("manager.cleanup_interrupted_games is unavailable; skipping interrupted-game cleanup.")
-    try:
-        await manager.reconcile_pending_round_statistics()
-        await reconcile_pending_match_statistics()
-    except Exception:
-        log.exception("Could not complete post-cleanup progression reconciliation")
     log.info("Pending next-round gates resumed.")
 
     # --- STARTUP DEPLOYMENT NOTIFICATION ---
@@ -143,7 +119,7 @@ async def post_init(app: Application) -> None:
 
         deploy_message = (
             "🚀 <b>Bot Restarted Successfully</b>\n\n"
-            f"<b>Version:</b> <code>{html.escape(commit_msg[:300])}</code>"
+            
         )
 
         await app.bot.send_message(
@@ -195,6 +171,12 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", lobby.help_command))
     app.add_handler(CommandHandler("report", lobby.report_command))
 
+    app.add_handler(CommandHandler("broadcast", broadcast.broadcast_dashboard))
+    app.add_handler(CommandHandler("cancel", broadcast.cancel_setup))
+    app.add_handler(CallbackQueryHandler(broadcast.on_broadcast_callback, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(broadcast.on_broadcast_job_callback, pattern=r"^bcjob:"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, broadcast.handle_content_message))
+
     # General callbacks
     app.add_handler(CallbackQueryHandler(lobby.help_callback, pattern=r"^help:"))
 
@@ -222,15 +204,12 @@ def build_application() -> Application:
 
 
 async def async_main() -> None:
-    # Start the health endpoint first, but always close it even if configuration
-    # validation/application construction fails.
+    # Render Web Services require an open HTTP port. This lightweight server
+    # runs alongside Telegram polling and exposes /health for UptimeRobot.
     health_server = await start_health_server()
-    app: Application | None = None
-    initialized = False
+    app = build_application()
     try:
-        app = build_application()
         await app.initialize()
-        initialized = True
 
         # With this custom lifecycle, invoke post_init explicitly after initialize().
         if app.post_init:
@@ -250,20 +229,14 @@ async def async_main() -> None:
         )
         await asyncio.Event().wait()
     finally:
-        try:
-            if app is not None:
-                if app.updater is not None and app.updater.running:
-                    await app.updater.stop()
-                if app.running:
-                    await app.stop()
-                if initialized:
-                    await app.shutdown()
-        finally:
-            try:
-                close_database()
-            finally:
-                health_server.close()
-                await health_server.wait_closed()
+        if app.updater is not None and app.updater.running:
+            await app.updater.stop()
+        if app.running:
+            await app.stop()
+        await app.shutdown()
+        close_database()
+        health_server.close()
+        await health_server.wait_closed()
 
 
 def main() -> None:

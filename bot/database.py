@@ -26,6 +26,7 @@ welcome_assets = db["welcome_assets"]
 bot_stats = db["bot_stats"]
 groups = db["groups"]
 match_history = db["match_history"]
+broadcast_jobs = db["broadcast_jobs"]
 
 async def ensure_indexes() -> None:
     await users.create_index(

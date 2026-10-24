@@ -48,8 +48,17 @@ def _is_rate_limited(user_id: int) -> bool:
 
 
 def _keyboard(active_scope: str, owner_id: int) -> InlineKeyboardMarkup:
+    # 1. Initial State: Only Overall and Rounds Menu buttons
+    if active_scope == "overall":
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ 🏆 Overall", callback_data=f"lb:overall:{owner_id}"),
+                InlineKeyboardButton("⚙️ Rounds ➡️", callback_data=f"lb:menu_rounds:{owner_id}")
+            ]
+        ])
+    
+    # 2. Expanded State: Showing all individual round buttons
     labels = {
-        "overall": "🏆 Overall",
         "rlgl": "🟢 RLGL",
         "dalgona": "🍪 Dalgona",
         "marbles": "🎱 Marbles",
@@ -62,13 +71,12 @@ def _keyboard(active_scope: str, owner_id: int) -> InlineKeyboardMarkup:
         label = labels[scope]
         if scope == active_scope:
             label = f"✅ {label}"
-        # Callback data me scope ke sath owner_id bhi store hogi
         return InlineKeyboardButton(label, callback_data=f"lb:{scope}:{owner_id}")
 
     return InlineKeyboardMarkup([
-        [button("overall"), button("rlgl"), button("dalgona")],
-        [button("marbles"), button("bridge"), button("vote")],
-        [button("final")],
+        [InlineKeyboardButton("🔙 Back to Overall", callback_data=f"lb:overall:{owner_id}")],
+        [button("rlgl"), button("dalgona"), button("marbles")],
+        [button("bridge"), button("vote"), button("final")],
     ])
 
 
@@ -146,30 +154,41 @@ async def on_leaderboard_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     parts = (query.data or "").split(":")
-    # Expected format: lb:<scope>:<owner_id>
-    if len(parts) != 3 or parts[0] != "lb" or parts[1] not in SCOPES:
+    if len(parts) != 3 or parts[0] != "lb":
         await query.answer()
         return
 
     scope = parts[1]
+    
+    # Validations
+    if scope not in SCOPES and scope != "menu_rounds":
+        await query.answer()
+        return
+
     try:
         owner_id = int(parts[2])
     except ValueError:
         await query.answer()
         return
 
-    # Check: Kya wahi user click kar raha hai jisne command run ki thi?
     if query.from_user.id != owner_id:
         await query.answer("❌ Not allowed.", show_alert=True)
         return
 
-    # Check button cooldown
     if _is_rate_limited(query.from_user.id):
         await query.answer("⏳ Please slow down! Don't spam.", show_alert=False)
         return
 
     try:
-        text = await _render_leaderboard(scope, owner_id)
+        if scope == "menu_rounds":
+            text = (
+                "🔺 <b>SQUID GAME · ROUND RANKINGS</b> 🔺\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Select a specific game round below to view its global leaderboards and your personal rank."
+            )
+        else:
+            text = await _render_leaderboard(scope, owner_id)
+            
         await query.edit_message_text(
             text=text,
             parse_mode=ParseMode.HTML,
