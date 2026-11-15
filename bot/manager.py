@@ -576,12 +576,13 @@ async def _game_finished_once(context, mid, survivor_ids, title):
                     # A failed private notice must not interrupt the match flow.
                     log.debug("Could not send round-result DM to user %s", uid, exc_info=True)
 
+            # --- AI BYPASS: Bots don't need DMs ---
             dm_tasks = [
                 _send_dm(
                     player["id"],
                     f"💀 <b>{html.escape(title)}</b> — you were eliminated.",
                 )
-                for player in newly_eliminated
+                for player in newly_eliminated if not player.get("is_bot")
             ]
             if len(survivors) > 1:
                 dm_tasks.extend(
@@ -590,7 +591,7 @@ async def _game_finished_once(context, mid, survivor_ids, title):
                         f"✅ You qualified <b>{html.escape(title)}</b>. "
                         "Return to the group and tap ENTER NEXT ROUND before the timer expires.",
                     )
-                    for player in survivors
+                    for player in survivors if not player.get("is_bot")
                 )
             if dm_tasks:
                 await asyncio.gather(*dm_tasks, return_exceptions=True)
@@ -682,7 +683,8 @@ async def _game_finished_once(context, mid, survivor_ids, title):
         "from_stage": previous_stage,
         "completed_title": title,
         "eligible_ids": [player["id"] for player in survivors],
-        "joined_ids": [],
+        # --- AI BYPASS: Instantly enter bots into the next round ---
+        "joined_ids": [player["id"] for player in survivors if player.get("is_bot")],
         "opened_at": now,
         "deadline": now + max(1, int(config.ROUND_ENTRY_SECONDS)),
     }
@@ -1015,7 +1017,8 @@ async def open_final_bracket_gate(context, mid, qualified_ids):
         "from_stage": "final",
         "completed_title": f"Final · Bracket {int((match.get('game') or {}).get('bracket_round', 1))}",
         "eligible_ids": eligible_ids,
-        "joined_ids": [],
+        # --- AI BYPASS: Instantly enter bots into the bracket ---
+        "joined_ids": [uid for uid in eligible_ids if get_player(match, uid) and get_player(match, uid).get("is_bot")],
         "opened_at": now,
         "deadline": now + max(1, int(config.ROUND_ENTRY_SECONDS)),
     }
@@ -1026,6 +1029,11 @@ async def open_final_bracket_gate(context, mid, qualified_ids):
     runtime.add_task(mid, asyncio.create_task(_next_round_entry_timeout(context, mid), name=f"next-round-gate:{mid}"))
 
     async def notify(uid):
+        # --- AI BYPASS: Bots don't need DMs ---
+        player = get_player(match, uid)
+        if player and player.get("is_bot"):
+            return
+            
         try:
             await context.bot.send_message(
                 uid,
