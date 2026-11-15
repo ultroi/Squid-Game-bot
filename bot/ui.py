@@ -777,10 +777,12 @@ def _rlgl_progress(player, size):
  
  
 def rlgl_render_context(match, light=None):
-    """Everything that is identical for every viewer, computed once per render batch."""
+    """Build one shared render context with dimensions matching the RLGL engine."""
     players = match.get("players") or []
-    size = max(1, int(config.GRID_SIZE))
- 
+    # rlgl.py allocates a track at least as wide as the player count.
+    # Match that size here so players are not clamped into the centre cell.
+    size = max(1, int(config.GRID_SIZE), len(players))
+
     occupants = {}
     for player in players:
         row, col = _player_position(player, size)
@@ -789,7 +791,7 @@ def rlgl_render_context(match, light=None):
         occupants.setdefault((row, col), []).append(
             (str(player.get("id")), emoji, dead)
         )
- 
+
     ranked = sorted(
         players,
         key=lambda p: (
@@ -800,7 +802,7 @@ def rlgl_render_context(match, light=None):
         reverse=True,
     )
     rank = {str(p.get("id")): index for index, p in enumerate(ranked, 1)}
- 
+
     return {
         "size": size,
         "occupants": occupants,
@@ -809,38 +811,38 @@ def rlgl_render_context(match, light=None):
         "counts": _rlgl_counts(players),
         "total": len(players),
     }
- 
- 
+
+
 def _rlgl_table(ctx, viewer_id=None):
-    """Race grid. The viewer's own cell is shown as 📍 so they can always find themselves."""
+    """Render a consistent race track with a single, clear finish-line header."""
     size = ctx["size"]
     occupants = ctx["occupants"]
     viewer = str(viewer_id) if viewer_id is not None else None
- 
-    rows = ['<table bordered striped compact>']
+
+    rows = [
+        '<table bordered striped compact>',
+        f'<tr><th colspan="{size}" align="center">🏁 FINISH LINE</th></tr>',
+    ]
     for row in range(size):
         cells = []
         for col in range(size):
             at_cell = occupants.get((row, col), [])
             if at_cell:
-                # Put the viewer first so the marker is never buried in a crowded cell.
+                # Put the viewer first so their marker remains visible in a shared cell.
                 ordered = sorted(at_cell, key=lambda item: item[0] != viewer)
-                value = "".join(
+                value = " ".join(
                     "📍" if (uid == viewer and not dead) else emoji
                     for uid, emoji, dead in ordered
                 )
-            elif row == 0:
-                value = "🏁"
-            elif row == size - 1:
-                value = "─"
             else:
-                value = "·"
+                value = "─" if row == size - 1 else "·"
             cells.append(f'<td align="center" valign="middle">{value}</td>')
         rows.append("<tr>" + "".join(cells) + "</tr>")
+
     rows.append("</table>")
     return "".join(rows)
- 
- 
+
+
 def _rlgl_standings(ctx, viewer_id=None, limit=5):
     """Top racers by progress, plus the viewer's own row when they are outside the top."""
     size = ctx["size"]
