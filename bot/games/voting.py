@@ -66,6 +66,51 @@ async def begin(context, mid):
     runtime.add_task(mid, asyncio.create_task(_run_round(context, mid)))
 
 
+# ---------------------------------------------------------------- AI worker loop (Bots)
+
+async def _ai_vote_worker(context, mid, uid):
+    """Simulates an AI player casting an elimination vote."""
+    await asyncio.sleep(random.uniform(2.0, 5.0)) # Add realistic human delay
+    
+    rt = runtime.get(mid)
+    trigger_resolve = False
+    
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "vote":
+            return
+            
+        game = match.get("game", {})
+        uid_str = str(uid)
+        
+        # Make sure bot hasn't already voted
+        if uid_str in game.get("votes", {}):
+            return
+            
+        # Find all alive players except the bot itself
+        eligible_targets = [p["id"] for p in match.get("players", []) if p.get("alive") and p["id"] != uid]
+        
+        if not eligible_targets:
+            return
+            
+        # Pick a random target to vote against
+        target = random.choice(eligible_targets)
+        game.setdefault("votes", {})[uid_str] = int(target)
+        
+        await save_match(match)
+        
+        # If this was the last vote needed, trigger resolution
+        if len(game["votes"]) >= len(alive(match)):
+            trigger_resolve = True
+            
+    await _refresh(context, mid)
+
+    if trigger_resolve:
+        await _resolve(context, mid)
+
+
+# ----------------------------------------------------------------
+
 async def _run_round(context, mid):
     """30s prep then send voting DMs and start timeout."""
     try:
@@ -83,7 +128,15 @@ async def _run_round(context, mid):
         latest = await get_match(mid)
         if not latest or latest.get("stage") != "vote":
             return
+            
         async def _send_vote_dm(player):
+            # --- AI BYPASS: Bots don't need DMs, simulate their turn ---
+            if player.get("is_bot"):
+                player["dm_mid"] = None
+                runtime.add_task(mid, asyncio.create_task(_ai_vote_worker(context, mid, player["id"])))
+                return
+            # -----------------------------------------------------------
+                
             try:
                 message = await context.bot.send_message(
                     chat_id=player["id"],

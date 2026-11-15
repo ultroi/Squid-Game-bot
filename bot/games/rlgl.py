@@ -121,6 +121,7 @@ def _hydrate_grid(match):
             "reached": bool(player.get("reached", False)),
             "name": player.get("name"),
             "emoji": player.get("emoji"),
+            "is_bot": bool(player.get("is_bot", False)), # Track AI players
         }
     return grid
 
@@ -288,6 +289,16 @@ async def _send_player_board(context, mid, match, rt, player, render_context,
                             phase_token, state_version):
     """Create a player's initial private board, retrying transient Telegram failures."""
     user_id = player.get("id")
+    
+    # AI Bypass: Do not attempt to DM a bot
+    if player.get("is_bot"):
+        player["dm_mid"] = None
+        uid = _uid_key(user_id)
+        rt["player_phase_tokens"][uid] = phase_token
+        rt["player_rendered_version"][uid] = state_version
+        rt["last_dm_refresh"][uid] = time.monotonic()
+        return True
+
     content = ui.rlgl_dm_html(
         match,
         user_id,
@@ -368,7 +379,8 @@ async def _countdown_to_race(context, mid):
 
 def _race_start_event(players):
     """Describe players who could not receive a private race board."""
-    unreachable = [player for player in players if not player.get("dm_mid")]
+    # Exclude AI players from the unreachable check
+    unreachable = [player for player in players if not player.get("dm_mid") and not player.get("is_bot")]
     if not unreachable:
         return "The race has started."
 
@@ -474,9 +486,62 @@ async def begin(context, mid):
         _move_tick_loop(context, mid),
         _render_worker(context, mid),
         _persist_loop(context, mid),
+        _ai_worker_loop(context, mid), # <--- AI Brain Loop Added
     )
     for worker in workers:
         runtime.add_task(mid, asyncio.create_task(worker))
+
+
+# ---------------------------------------------------------------- AI worker loop (Bots)
+
+async def _ai_worker_loop(context, mid):
+    """Simulates AI player actions by directly pushing into the move queue."""
+    rt = runtime.get(mid)
+    try:
+        while not rt.get("done"):
+            await asyncio.sleep(0.4) # Fast enough to maintain pacing
+            
+            if rt.get("done") or rt.get("round_finalizing"):
+                break
+                
+            grid = rt.get("grid") or {}
+            light = rt.get("light")
+            token = str(rt.get("phase_token", "0"))
+            now = time.monotonic()
+            last_moves = rt.setdefault("last_move_at", {})
+            
+            for uid, player in grid.items():
+                if not player.get("is_bot") or not _is_racing(player):
+                    continue
+                    
+                should_move = False
+                if light == "green":
+                    # High chance to tap forward when it's green
+                    should_move = random.random() < 0.8
+                elif light == "red":
+                    # 2% chance to accidentally tap during red light (simulating panic/human error)
+                    should_move = random.random() < 0.02
+                    
+                if should_move:
+                    if now - last_moves.get(uid, 0.0) < MOVE_COOLDOWN:
+                        continue
+                        
+                    last_moves[uid] = now
+                    move = {
+                        "uid": int(uid),
+                        "direction": "up",
+                        "token": token,
+                        "at": now,
+                        "fut": None, # AI does not wait for a callback resolution
+                    }
+                    try:
+                        rt["move_queue"].put_nowait(move)
+                    except asyncio.QueueFull:
+                        pass
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("RLGL AI worker loop crashed (mid=%s)", mid)
 
 
 # ---------------------------------------------------------------- move tick (memory only)
@@ -1129,4 +1194,3 @@ async def on_move(update, context):
     except asyncio.TimeoutError:
         message, alert = None, False
     await safe_answer(query, message, alert)
-

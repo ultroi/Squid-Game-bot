@@ -82,6 +82,7 @@ def _preparation_details(match, seconds_left):
         f"⏱ <b>Play time:</b> {config.BRIDGE_SECONDS}s",
     ))
 
+
 def _bridge_details(match):
     g = match.get("game") or {}
     queue = g.get("queue") or []
@@ -119,6 +120,41 @@ async def _refresh(context, mid, event=None, finished=False):
         await refresh_lobby_scoreboard(context, mid, force=True)
 
 
+# ---------------------------------------------------------------- AI worker loop (Bots)
+
+async def _ai_bridge_worker(context, mid, uid):
+    """Simulates an AI player making a hop on the glass bridge."""
+    await asyncio.sleep(random.uniform(1.5, 3.0)) # Add realistic human delay
+    
+    rt = runtime.get(mid)
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "bridge":
+            return
+            
+        g = match.get("game", {})
+        # Verify it is still this bot's turn (in case of timeouts or state changes)
+        if g.get("idx", 0) >= len(g.get("queue", [])) or g["queue"][g["idx"]] != uid:
+            return
+            
+        side = random.randint(0, 1) # 0 for left, 1 for right
+        result = _apply_pick(match, uid, side)
+        
+        if result["error_msg"] is None and result["result_kind"] is not None:
+            await save_match(match)
+            
+    if result["error_msg"] is not None:
+        return # Something went wrong, abort
+
+    await _refresh(context, mid)
+    
+    if result["result_kind"] in ("win", "dead"):
+        await _next(context, mid)
+    elif result["result_kind"] == "safe":
+        # Bot survived this step, schedule the next jump!
+        runtime.add_task(mid, asyncio.create_task(_ai_bridge_worker(context, mid, uid)))
+
+
 async def _prompt(context, mid):
     rt = runtime.get(mid)
     async with rt["lock"]:
@@ -141,6 +177,12 @@ async def _prompt(context, mid):
     if not p:
         await _next(context, mid)
         return
+
+    # --- AI BYPASS: Bots don't need DMs, simulate their turn ---
+    if p.get("is_bot"):
+        runtime.add_task(mid, asyncio.create_task(_ai_bridge_worker(context, mid, uid)))
+        return
+    # -----------------------------------------------------------
 
     try:
         m = await context.bot.send_message(

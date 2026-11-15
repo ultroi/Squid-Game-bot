@@ -204,8 +204,6 @@ def build_application() -> Application:
 
 
 async def async_main() -> None:
-    # Render Web Services require an open HTTP port. This lightweight server
-    # runs alongside Telegram polling and exposes /health for UptimeRobot.
     health_server = await start_health_server()
     app = build_application()
     try:

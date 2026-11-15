@@ -107,6 +107,11 @@ async def begin(context, mid):
     match["game"] = {"pairs": pairs, "bye": bye, "last_event": None, "round_finished": False}
 
     async def _send_preparation_dm(player):
+        # AI BYPASS
+        if player.get("is_bot"):
+            player["dm_mid"] = None
+            return
+            
         text = "🎱 <b>Marbles is preparing!</b>\n\nWait for the group countdown to finish..."
         if bye and player["id"] == bye:
             text = "🎟 <b>You received a BYE!</b>\n\nYou automatically advance to the next round. Please wait for others to finish."
@@ -161,6 +166,114 @@ async def _run_round(context, mid):
         logging.getLogger(__name__).exception("Marbles run_round crashed")
 
 
+# ---------------------------------------------------------------- AI worker loop (Bots)
+
+async def _ai_hide_worker(context, mid, uid):
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+    rt = runtime.get(mid)
+    guesser = None
+    max_bet = 0
+    guesser_dm = None
+    is_guesser_bot = False
+    
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "marbles": return
+        pair = _find_pair(match, uid)
+        if not pair or pair.get("phase") != "hide" or pair.get("hider") != uid: return
+        
+        marbles = pair["marbles"][str(uid)]
+        n = random.randint(1, marbles)
+        pair["hidden"] = n
+        pair["phase"] = "bet"
+        await save_match(match)
+        
+        guesser = _other(pair, uid)
+        max_bet = min(pair["marbles"][str(guesser)], pair["marbles"][str(uid)])
+        guesser_player = get_player(match, guesser)
+        guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+        is_guesser_bot = guesser_player.get("is_bot") if guesser_player else False
+        
+    # If guesser is human, prompt them to bet
+    if guesser_dm and not is_guesser_bot:
+        await safe_edit(
+            context.bot, guesser, guesser_dm,
+            f"🎲 Partner hid their marbles! Place your bet (1–{max_bet}):",
+            reply_markup=ui.marbles_count_keyboard(mid, "bet", max_bet)
+        )
+        
+    await _refresh_group(context, mid)
+    
+    # If guesser is bot, trigger the bot to bet
+    if is_guesser_bot:
+        runtime.add_task(mid, asyncio.create_task(_ai_bet_worker(context, mid, guesser, max_bet)))
+
+async def _ai_bet_worker(context, mid, uid, max_bet):
+    await asyncio.sleep(random.uniform(1.0, 2.5))
+    rt = runtime.get(mid)
+    
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "marbles": return
+        pair = _find_pair(match, uid)
+        if not pair or pair.get("phase") != "bet" or pair.get("hider") == uid: return
+        
+        n = random.randint(1, max_bet)
+        pair["bet"] = n
+        pair["phase"] = "guess"
+        await save_match(match)
+        
+    await _refresh_group(context, mid)
+    
+    # Immediately trigger guess worker since it's the same bot doing the guess
+    runtime.add_task(mid, asyncio.create_task(_ai_guess_worker(context, mid, uid)))
+
+async def _ai_guess_worker(context, mid, uid):
+    await asyncio.sleep(random.uniform(1.0, 2.0))
+    rt = runtime.get(mid)
+    
+    result_text = None
+    hider = None
+    pair_finished = False
+    next_pair_state = None
+    guesser_dm = None
+    hider_dm = None
+    hider_is_bot = False
+    
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "marbles": return
+        pair = _find_pair(match, uid)
+        if not pair or pair.get("phase") != "guess" or pair.get("hider") == uid: return
+        
+        choice = random.choice(["odd", "even"])
+        result_text, hider, pair_finished, next_pair_state = _apply_guess(match, pair, uid, choice)
+        
+        guesser_player = get_player(match, uid)
+        hider_player = get_player(match, hider)
+        guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+        hider_dm = hider_player.get("dm_mid") if hider_player else None
+        hider_is_bot = hider_player.get("is_bot") if hider_player else False
+        
+        await save_match(match)
+        
+    markup = ui.kb([]) if pair_finished else None
+    
+    # Update human hider's DM (if any)
+    if hider_dm and not hider_is_bot:
+        await safe_edit(context.bot, hider, hider_dm, result_text, reply_markup=markup)
+        
+    await _refresh_group(context, mid)
+    
+    if pair_finished:
+        await _check_end(context, mid)
+    elif next_pair_state:
+        await asyncio.sleep(2.0)
+        await _prompt_hide(context, mid, next_pair_state)
+
+# ----------------------------------------------------------------
+
+
 async def _prompt_hide(context, mid, pair):
     rt = runtime.get(mid)
     async with rt["lock"]:
@@ -176,43 +289,49 @@ async def _prompt_hide(context, mid, pair):
         guesser_player = get_player(match, guesser)
         hider_dm = hider_player.get("dm_mid") if hider_player else None
         guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+        hider_is_bot = hider_player.get("is_bot") if hider_player else False
+        guesser_is_bot = guesser_player.get("is_bot") if guesser_player else False
 
     # HIDER DM
-    hider_text = (
-        f"🎱 You are the <b>HIDER</b> (you: {hider_marbles} 🎱 | "
-        f"foe: {guesser_marbles} 🎱)\nHow many marbles do you hide in your fist?"
-    )
-    hider_markup = ui.marbles_count_keyboard(mid, "hide", hider_marbles)
-    
-    if hider_dm:
-        await safe_edit(context.bot, hider, hider_dm, hider_text, reply_markup=hider_markup)
+    if hider_is_bot:
+        runtime.add_task(mid, asyncio.create_task(_ai_hide_worker(context, mid, hider)))
     else:
-        try:
-            message = await context.bot.send_message(
-                hider, hider_text, reply_markup=hider_markup, parse_mode="HTML"
-            )
-            async with rt["lock"]:
-                match = await get_match(mid)
-                get_player(match, hider)["dm_mid"] = message.message_id
-                await save_match(match)
-        except Exception:
-            pass
+        hider_text = (
+            f"🎱 You are the <b>HIDER</b> (you: {hider_marbles} 🎱 | "
+            f"foe: {guesser_marbles} 🎱)\nHow many marbles do you hide in your fist?"
+        )
+        hider_markup = ui.marbles_count_keyboard(mid, "hide", hider_marbles)
+        
+        if hider_dm:
+            await safe_edit(context.bot, hider, hider_dm, hider_text, reply_markup=hider_markup)
+        else:
+            try:
+                message = await context.bot.send_message(
+                    hider, hider_text, reply_markup=hider_markup, parse_mode="HTML"
+                )
+                async with rt["lock"]:
+                    match = await get_match(mid)
+                    get_player(match, hider)["dm_mid"] = message.message_id
+                    await save_match(match)
+            except Exception:
+                pass
 
     # GUESSER DM
-    guesser_text = f"🎱 {hider_name} is hiding marbles… get ready to bet!"
-    if guesser_dm:
-        await safe_edit(context.bot, guesser, guesser_dm, guesser_text, reply_markup=ui.kb([]))
-    else:
-        try:
-            message = await context.bot.send_message(
-                guesser, guesser_text, parse_mode="HTML"
-            )
-            async with rt["lock"]:
-                match = await get_match(mid)
-                get_player(match, guesser)["dm_mid"] = message.message_id
-                await save_match(match)
-        except Exception:
-            pass
+    if not guesser_is_bot:
+        guesser_text = f"🎱 {hider_name} is hiding marbles… get ready to bet!"
+        if guesser_dm:
+            await safe_edit(context.bot, guesser, guesser_dm, guesser_text, reply_markup=ui.kb([]))
+        else:
+            try:
+                message = await context.bot.send_message(
+                    guesser, guesser_text, parse_mode="HTML"
+                )
+                async with rt["lock"]:
+                    match = await get_match(mid)
+                    get_player(match, guesser)["dm_mid"] = message.message_id
+                    await save_match(match)
+            except Exception:
+                pass
 
 
 async def on_hide(update, context):
@@ -228,6 +347,7 @@ async def on_hide(update, context):
     max_bet = 0
     hider_dm = None
     guesser_dm = None
+    guesser_is_bot = False
 
     async with rt["lock"]:
         match = await get_match(mid)
@@ -244,7 +364,10 @@ async def on_hide(update, context):
                 guesser = _other(pair, uid)
                 max_bet = min(pair["marbles"][str(guesser)], pair["marbles"][str(pair["hider"])])
                 hider_dm = get_player(match, pair["hider"]).get("dm_mid")
-                guesser_dm = get_player(match, guesser).get("dm_mid")
+                
+                guesser_player = get_player(match, guesser)
+                guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+                guesser_is_bot = guesser_player.get("is_bot") if guesser_player else False
 
     if error_msg is not None:
         await safe_answer(q, error_msg, alert)
@@ -253,7 +376,10 @@ async def on_hide(update, context):
     await safe_answer(q, f"You hid {n} 🎱")
     if hider_dm:
         await safe_edit(context.bot, uid, hider_dm, f"🎱 You hid <b>{n}</b>. Waiting for the guesser…")
-    if guesser_dm:
+        
+    if guesser_is_bot:
+        runtime.add_task(mid, asyncio.create_task(_ai_bet_worker(context, mid, guesser, max_bet)))
+    elif guesser_dm:
         await safe_edit(
             context.bot, guesser, guesser_dm,
             f"🎲 Partner hid their marbles! Place your bet (1–{max_bet}):",
@@ -272,6 +398,7 @@ async def on_bet(update, context):
     error_msg = None
     alert = False
     guesser_dm = None
+    guesser_is_bot = False
 
     async with rt["lock"]:
         match = await get_match(mid)
@@ -285,14 +412,19 @@ async def on_bet(update, context):
                 pair["bet"] = n
                 pair["phase"] = "guess"
                 await save_match(match)
-                guesser_dm = get_player(match, uid).get("dm_mid")
+                guesser_player = get_player(match, uid)
+                guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
+                guesser_is_bot = guesser_player.get("is_bot") if guesser_player else False
 
     if error_msg is not None:
         await safe_answer(q, error_msg, alert)
         return
 
     await safe_answer(q, f"Bet: {n} 🎱")
-    if guesser_dm:
+    
+    # Technically humans shouldn't be triggering this if they are bots,
+    # but the check ensures safety.
+    if guesser_dm and not guesser_is_bot:
         await safe_edit(
             context.bot, uid, guesser_dm,
             f"🎲 Bet: <b>{n} 🎱</b> — is the hidden amount ODD or EVEN?",
@@ -366,6 +498,8 @@ async def on_guess(update, context):
     hider_dm = None
     pair_finished = False
     next_pair_state = None
+    guesser_is_bot = False
+    hider_is_bot = False
 
     async with rt["lock"]:
         match = await get_match(mid)
@@ -381,8 +515,13 @@ async def on_guess(update, context):
                 )
                 guesser_player = get_player(match, guesser)
                 hider_player = get_player(match, hider)
+                
                 guesser_dm = guesser_player.get("dm_mid") if guesser_player else None
                 hider_dm = hider_player.get("dm_mid") if hider_player else None
+                
+                guesser_is_bot = guesser_player.get("is_bot") if guesser_player else False
+                hider_is_bot = hider_player.get("is_bot") if hider_player else False
+                
                 await save_match(match)
 
     if error_msg is not None:
@@ -391,11 +530,12 @@ async def on_guess(update, context):
 
     await safe_answer(query)
     markup = ui.kb([]) if pair_finished else None
-    if guesser_dm:
+    
+    if guesser_dm and not guesser_is_bot:
         await safe_edit(
             context.bot, guesser, guesser_dm, result_text, reply_markup=markup
         )
-    if hider_dm:
+    if hider_dm and not hider_is_bot:
         await safe_edit(
             context.bot, hider, hider_dm, result_text, reply_markup=markup
         )

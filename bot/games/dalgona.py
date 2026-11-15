@@ -182,11 +182,16 @@ async def begin(context, mid: str) -> None:
     if not match or match.get('stage') != 'dalgona':
         return
     players = alive(match)
-    player_states = {str(p['id']): {'progress': 0, 'phase': 'preparation', 'dm_mid': None, 'done': False} for p in players}
+    player_states = {str(p['id']): {'progress': 0, 'phase': 'preparation', 'dm_mid': None, 'done': False, 'is_bot': p.get('is_bot', False)} for p in players}
     match['game'] = {'players': player_states, 'last_event': None, 'round_finished': False, 'current_shape_index': random.randint(0, len(GROUP_SHAPES) - 1), 'current_sequence': [], 'sequence_phase': 'preparation', 'input_seconds': None, 'dm_prompt_message_id': None}
     await save_match(match)
     await ui.send_round_announcement(context.bot, match, 'dalgona', details=_group_details(match, PREPARATION_SECONDS))
     for p in players:
+        # AI BYPASS: Bots don't need DMs
+        if p.get('is_bot'):
+            match['game']['players'][str(p['id'])]['dm_mid'] = None
+            continue
+            
         try:
             msg = await context.bot.send_message(chat_id=p['id'], text='🍪 <b>Dalgona has started!</b>\n\nWatch the group chat for the pattern.', parse_mode='HTML')
             match['game']['players'][str(p['id'])]['dm_mid'] = msg.message_id
@@ -195,6 +200,83 @@ async def begin(context, mid: str) -> None:
             match['game']['players'][str(p['id'])]['phase'] = 'dead'
     await save_match(match)
     runtime.add_task(mid, asyncio.create_task(_run_game(context, mid)))
+    runtime.add_task(mid, asyncio.create_task(_ai_dalgona_worker(context, mid))) # START AI BRAIN
+
+# ---------------------------------------------------------------- AI worker loop (Bots)
+async def _ai_dalgona_worker(context, mid: str):
+    """Simulates AI players 'tapping' the Dalgona sequence."""
+    rt = runtime.get(mid)
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            
+            # Use state lock to read consistent game phase
+            async with _state_lock(mid):
+                match = await get_match(mid)
+                if not match or match.get('stage') != 'dalgona' or match.get('game', {}).get('round_finished'):
+                    return
+                    
+                game = match.get('game', {})
+                if game.get('sequence_phase') != 'input':
+                    continue # Wait until it's time to play
+                    
+            # Input phase is active. Get tracker from runtime
+            tracker = rt.get('dalgona_tracker')
+            if not tracker:
+                continue
+                
+            sequence = tracker.get('sequence', [])
+            seq_len = len(sequence)
+            event = rt.get('dalgona_wave_event')
+            
+            all_ai_done_or_dead = True
+            
+            for uid_str, p_state in list(tracker.get('players', {}).items()):
+                # Fetch full player data from match to check is_bot flag
+                match_players = game.get('players', {})
+                if not match_players.get(uid_str, {}).get('is_bot'):
+                    continue
+                    
+                if not p_state['alive'] or p_state['done']:
+                    continue
+                    
+                all_ai_done_or_dead = False
+                
+                # Simulate a tap
+                player_lock = rt.setdefault('dalgona_player_locks', {}).setdefault(uid_str, asyncio.Lock())
+                async with player_lock:
+                    if not p_state['alive'] or p_state['done']:
+                        continue
+                        
+                    progress = p_state['progress']
+                    if progress < 0 or progress >= seq_len:
+                        continue
+                        
+                    # 5% chance to break the candy (wrong tap)
+                    makes_mistake = random.random() < 0.05
+                    
+                    if makes_mistake:
+                        p_state['alive'] = False
+                        await update_dalgona_tap(mid, int(uid_str), {'alive': False}, {'progress': progress, 'done': False, 'phase': 'dead'})
+                    else:
+                        p_state['progress'] += 1
+                        if p_state['progress'] >= seq_len:
+                            p_state['done'] = True
+                            await update_dalgona_tap(mid, int(uid_str), {'alive': True}, {'progress': p_state['progress'], 'done': True, 'phase': 'input'})
+                        else:
+                            await update_dalgona_tap(mid, int(uid_str), {'alive': True}, {'progress': p_state['progress'], 'done': False, 'phase': 'input'})
+                            
+            # Check if everyone (humans and bots) is done
+            alive_players = [p for p in tracker['players'].values() if p['alive']]
+            all_alive_done = all((p['done'] for p in alive_players))
+            if (not alive_players or all_alive_done) and event:
+                event.set()
+                
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception('Dalgona AI worker loop crashed (match=%s)', mid)
+# ----------------------------------------------------------------
 
 
 async def _run_game(context, mid: str) -> None:
@@ -296,7 +378,11 @@ async def _run_game(context, mid: str) -> None:
             await _refresh_group(context, mid)
             await _send_dm_prompt(context, mid, shape_name, emoji, seq_len)
             alive_players = [player for player in match.get('players', []) if player.get('alive', True) and isinstance((match.get('game', {}).get('players', {}) or {}).get(str(player.get('id'))), dict)]
-            dm_actions = [safe_edit(context.bot, player['id'], match['game']['players'][str(player['id'])].get('dm_mid'), f'🍪 <b>{emoji} {shape_name.upper()}</b>\n\nGet ready... controls open in {DM_READY_SECONDS}s!', reply_markup=ui.dalgona_keyboard(mid, shape_idx)) for player in alive_players]
+            
+            # Filter out bots for the DMs
+            human_players = [p for p in alive_players if not match['game']['players'][str(p['id'])].get('is_bot')]
+            dm_actions = [safe_edit(context.bot, player['id'], match['game']['players'][str(player['id'])].get('dm_mid'), f'🍪 <b>{emoji} {shape_name.upper()}</b>\n\nGet ready... controls open in {DM_READY_SECONDS}s!', reply_markup=ui.dalgona_keyboard(mid, shape_idx)) for player in human_players]
+            
             await asyncio.gather(*dm_actions, return_exceptions=True)
             await asyncio.sleep(DM_READY_SECONDS)
             async with _state_lock(mid):
@@ -316,7 +402,9 @@ async def _run_game(context, mid: str) -> None:
                 rt = runtime.get(mid)
                 rt['dalgona_wave_event'] = event
                 rt['dalgona_tracker'] = {'round_index': shape_idx, 'sequence': sequence, 'players': {str(player['id']): {'progress': 0, 'done': False, 'alive': True, 'dm_mid': player_states.get(str(player['id']), {}).get('dm_mid')} for player in alive_players if isinstance(player_states.get(str(player['id'])), dict)}}
-            input_actions = [safe_edit(context.bot, player['id'], match['game']['players'][str(player['id'])].get('dm_mid'), f'🚦 <b>GO!</b> You have {input_seconds}s to repeat the {seq_len}-tap pattern.', reply_markup=ui.dalgona_keyboard(mid, shape_idx)) for player in alive_players if isinstance(match['game'].get('players', {}).get(str(player['id'])), dict)]
+            
+            input_actions = [safe_edit(context.bot, player['id'], match['game']['players'][str(player['id'])].get('dm_mid'), f'🚦 <b>GO!</b> You have {input_seconds}s to repeat the {seq_len}-tap pattern.', reply_markup=ui.dalgona_keyboard(mid, shape_idx)) for player in human_players if isinstance(match['game'].get('players', {}).get(str(player['id'])), dict)]
+            
             await asyncio.gather(*input_actions, return_exceptions=True)
             try:
                 await asyncio.wait_for(event.wait(), timeout=input_seconds)
@@ -343,7 +431,9 @@ async def _run_game(context, mid: str) -> None:
                         else:
                             dm_mid = None
                         timed_out_count += 1
-                        if dm_mid:
+                        
+                        # Only send timeout to humans
+                        if dm_mid and not state.get("is_bot"):
                             _spawn_background_task(
                                 safe_edit(context.bot, player['id'], dm_mid, "💀 <b>TIME'S UP!</b> Candy broken."),
                                 name=f"dalgona-timeout-player:{mid}:{player['id']}",

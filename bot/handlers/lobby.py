@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime, timezone
 import html
-
+import secrets
 from telegram import ChatMember, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, TelegramError
 from telegram.ext import ContextTypes
@@ -35,6 +35,98 @@ _lobby_create_locks: dict[int, tuple[asyncio.Lock, int]] = {}
 _lobby_create_locks_guard = asyncio.Lock()
 _player_join_locks: dict[int, tuple[asyncio.Lock, int]] = {}
 _player_join_locks_guard = asyncio.Lock()
+
+
+# ---------------- AI player names ----------------
+
+_AI_FIRST_NAMES = [
+    # Indian names
+    "Aarav", "Arjun", "Kabir", "Rohan", "Vihaan",
+    "Ishaan", "Reyansh", "Ayaan", "Vivaan", "Aditya",
+    "Krishna", "Dev", "Rudra", "Veer", "Shaurya",
+    "Ananya", "Meera", "Diya", "Kavya", "Saanvi",
+    "Ira", "Riya", "Aadhya", "Kiara", "Myra",
+
+    # Anime-inspired names
+    "Naruto", "Sasuke", "Itachi", "Kakashi", "Madara",
+    "Minato", "Sakura", "Hinata", "Nezuko", "Tanjiro",
+    "Zenitsu", "Giyu", "Gojo", "Yuji", "Megumi",
+    "Levi", "Eren", "Mikasa", "Armin", "Luffy",
+    "Zoro", "Sanji", "Ace", "Law", "Ichigo",
+    "Rukia", "Light", "L", "Killua", "Gon",
+]
+
+_AI_LAST_NAMES = [
+    # Indian surnames
+    "Sharma", "Verma", "Singh", "Patel", "Mehta",
+    "Kapoor", "Malhotra", "Reddy", "Gupta", "Rathore",
+    "Chauhan", "Mishra", "Yadav", "Joshi", "Desai",
+
+    # Anime-inspired surnames
+    "Uchiha", "Uzumaki", "Hatake", "Hyuga", "Senju",
+    "Ackerman", "Yeager", "Jaeger", "Kamado", "Agatsuma",
+    "Todoroki", "Midoriya", "Bakugo", "Gojo", "Fushiguro",
+    "Kurosaki", "Zoldyck", "Monkey", "Roronoa", "D. Ace",
+]
+
+
+def generate_ai_name(players: list[dict]) -> str:
+    """Generate a random unique Indian/anime-style AI name."""
+
+    used_names = {
+        " ".join(str(p.get("name", "")).split()).casefold()
+        for p in players
+        if p.get("name")
+    }
+
+    available_names = [
+        f"{first} {last}"
+        for first in _AI_FIRST_NAMES
+        for last in _AI_LAST_NAMES
+        if f"{first} {last}".casefold() not in used_names
+    ]
+
+    if not available_names:
+        raise RuntimeError("AI name pool exhausted.")
+
+    return secrets.choice(available_names)
+
+
+def _human_players(players: list[dict]) -> list[dict]:
+    """Return real Telegram contestants, excluding simulated AI players."""
+    return [player for player in players if not player.get("is_bot", False)]
+
+
+def _fill_lobby_with_ai(match: dict) -> int:
+    """Fill all remaining slots, provided at least one human has joined."""
+    players = match.setdefault("players", [])
+    if not _human_players(players):
+        return 0
+    if len(players) > config.MAX_PLAYERS:
+        raise ValueError(
+            f"Lobby has {len(players)} players, exceeding MAX_PLAYERS={config.MAX_PLAYERS}."
+        )
+
+    used_ids = {player.get("id") for player in players}
+    added = 0
+    while len(players) < config.MAX_PLAYERS:
+        ai_id = -9999000
+        while ai_id in used_ids:
+            ai_id -= 1
+        emoji = config.PLAYER_EMOJIS[len(players) % len(config.PLAYER_EMOJIS)]
+        players.append({
+            "id": ai_id,
+            "name": generate_ai_name(players),
+            "emoji": emoji,
+            "alive": True,
+            "dm_mid": None,
+            "pos": None,
+            "reached": False,
+            "is_bot": True,
+        })
+        used_ids.add(ai_id)
+        added += 1
+    return added
 
 
 @asynccontextmanager
@@ -472,8 +564,15 @@ async def _lobby_countdown(context, mid):
             runtime.add_task(mid, asyncio.create_task(_lobby_countdown(context, mid), name=f"lobby:{mid}"))
             return
             
+        # Only fill the lobby when at least one real Telegram user joined.
+        players = match.get("players", [])
+        human_count = len(_human_players(players))
+        if human_count:
+            _fill_lobby_with_ai(match)
+            await save_match(match)
+
         players_count = len(match.get("players", []))
-        if players_count >= config.MIN_PLAYERS:
+        if human_count and players_count >= config.MIN_PLAYERS:
             try:
                 await advance(context, mid)
             except Exception:
@@ -532,34 +631,39 @@ async def on_start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = ("Lobby is closed.", True)
         elif q.from_user.id != match.get("host_id", match.get("created_by")):
             response = ("Only the host can start the game!", True)
-        elif len(match.get("players", [])) < config.MIN_PLAYERS:
-            response = (f"Need at least {config.MIN_PLAYERS} players!", True)
         else:
-            runtime.cancel_tasks(mid)
-            await safe_answer(q, "Game starting! 🔺")
-            response = None  # callback is answered before potentially slow round setup
-            try:
-                await advance(context, mid)
-            except Exception:
-                log.exception("Failed to start game via button for match %s", mid)
-                start_error = "⚠️ <b>FAILED TO START GAME</b>\n\nThe round could not initialize. Start a new lobby with /enterthehell."
-                latest = await get_match(mid)
-                if latest and latest.get("stage") != "finished":
-                    await record_match_interruption(
-                        mid, latest.get("players", []), latest.get("round_results"),
-                        chat_id=latest.get("chat_id"),
-                        round_history=latest.get("round_history", []),
-                        reason="manual_start_failed",
-                    )
-                    latest["stage"] = "finished"
-                    latest["stats_finalized"] = True
-                    await save_match(latest)
-                    runtime.clear(mid)
-                    await refresh_lobby_scoreboard(context, mid, force=True)
-                    try:
-                        await safe_edit(context.bot, latest["chat_id"], latest.get("round_message_id") or latest.get("lobby_message_id"), start_error, reply_markup=ui.kb([]))
-                    except Exception:
-                        log.exception("Could not display failed-start notice for match %s", mid)
+            players = match.get("players", [])
+            if not _human_players(players):
+                response = ("At least one human player must join before the game can start.", True)
+            else:
+                _fill_lobby_with_ai(match)
+                await save_match(match)
+
+                runtime.cancel_tasks(mid)
+                await safe_answer(q, "Game starting! 🔺")
+                response = None  # callback is answered before potentially slow round setup
+                try:
+                    await advance(context, mid)
+                except Exception:
+                    log.exception("Failed to start game via button for match %s", mid)
+                    start_error = "⚠️ <b>FAILED TO START GAME</b>\n\nThe round could not initialize. Start a new lobby with /enterthehell."
+                    latest = await get_match(mid)
+                    if latest and latest.get("stage") != "finished":
+                        await record_match_interruption(
+                            mid, latest.get("players", []), latest.get("round_results"),
+                            chat_id=latest.get("chat_id"),
+                            round_history=latest.get("round_history", []),
+                            reason="manual_start_failed",
+                        )
+                        latest["stage"] = "finished"
+                        latest["stats_finalized"] = True
+                        await save_match(latest)
+                        runtime.clear(mid)
+                        await refresh_lobby_scoreboard(context, mid, force=True)
+                        try:
+                            await safe_edit(context.bot, latest["chat_id"], latest.get("round_message_id") or latest.get("lobby_message_id"), start_error, reply_markup=ui.kb([]))
+                        except Exception:
+                            log.exception("Could not display failed-start notice for match %s", mid)
 
     if response is not None:
         await safe_answer(q, response[0], response[1])

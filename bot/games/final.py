@@ -258,6 +258,43 @@ def _duel_prompt_text(match, duel, uid):
         "Choose your move. Your choice stays hidden until both players select."
     )
 
+
+# ---------------------------------------------------------------- AI worker loop (Bots)
+
+async def _ai_final_worker(context, mid, idx, uid):
+    """Simulates an AI player making a combat choice in the final."""
+    await asyncio.sleep(random.uniform(2.0, 5.0)) # Add realistic human delay
+    
+    rt = runtime.get(mid)
+    picks_count = 0
+    
+    async with rt["lock"]:
+        match = await get_match(mid)
+        if not match or match.get("stage") != "final":
+            return
+            
+        game = match["game"]
+        if idx >= len(game.get("duels", [])):
+            return
+            
+        duel = game["duels"][idx]
+        # Ensure duel is ongoing and it's this player's turn
+        if duel["winner"] is not None or str(uid) not in (str(duel["a"]), str(duel["b"])):
+            return
+            
+        if str(uid) in duel.get("picks", {}):
+            return # Bot already picked
+            
+        choice = random.choice(list(LABEL.keys()))
+        duel.setdefault("picks", {})[str(uid)] = choice
+        await save_match(match)
+        picks_count = len(duel["picks"])
+        
+    await _refresh_group(context, mid)
+    if picks_count == 2:
+        await _resolve_exchange(context, mid, idx)
+
+
 async def _prompt_duel(context, mid, idx, intro=False):
     rt = runtime.get(mid)
     async with rt["lock"]:
@@ -272,9 +309,16 @@ async def _prompt_duel(context, mid, idx, intro=False):
                 "uid": uid,
                 "text": _duel_prompt_text(match, duel, uid),
                 "dm_mid": player.get("dm_mid") if player else None,
+                "is_bot": player.get("is_bot") if player else False
             })
 
     for info in updates_needed:
+        # --- AI BYPASS: Simulate bot pick ---
+        if info.get("is_bot"):
+            runtime.add_task(mid, asyncio.create_task(_ai_final_worker(context, mid, idx, info["uid"])))
+            continue
+        # ------------------------------------
+        
         try:
             if not info["dm_mid"]:
                 message = await context.bot.send_message(
